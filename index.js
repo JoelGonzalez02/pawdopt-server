@@ -5,6 +5,7 @@ import axios from "axios";
 import dotenv from "dotenv";
 import cors from "cors";
 import querystring from "querystring";
+import cron from "node-cron";
 import { buildReelsCache } from "./worker.js";
 
 // --- CONFIGURATION ---
@@ -87,48 +88,16 @@ app.get("/", (req, res) => {
   res.send("PawBond Server is running!");
 });
 
-// New endpoint to save a user's location
-app.post("/api/user-location", async (req, res) => {
-  const { userId, location } = req.body;
-
-  if (!userId || !location) {
-    return res
-      .status(400)
-      .json({ message: "userId and location are required." });
-  }
-
-  try {
-    const userKey = `user:${userId}`;
-    await redis.set(userKey, location);
-    console.log(`Updated location for ${userKey} to ${location}`);
-    res.status(200).json({ message: "Location updated successfully." });
-  } catch (error) {
-    console.error("Error saving user location:", error);
-    res.status(500).json({ message: "Failed to update location." });
-  }
-});
-
-// Reels endpoint now uses userId to find the location
+// Reels endpoint with "wait-and-respond" logic
 app.get("/api/reels", async (req, res) => {
-  const { userId } = req.query;
-  if (!userId) {
-    return res.status(400).json({ message: "userId parameter is required." });
+  const { location } = req.query;
+  if (!location) {
+    return res.status(400).json({ message: "Location parameter is required." });
   }
 
+  const cacheKey = `reels:${location}`;
   try {
-    const userKey = `user:${userId}`;
-    const location = await redis.get(userKey);
-
-    if (!location) {
-      return res.status(404).json({
-        message:
-          "No location found for this user. Please set a location in settings.",
-      });
-    }
-
-    const cacheKey = `reels:${location}`;
     const cachedReels = await redis.get(cacheKey);
-
     if (cachedReels) {
       console.log(`REELS HIT: Serving list for ${location} from Redis.`);
       const data = JSON.parse(cachedReels);
@@ -142,6 +111,7 @@ app.get("/api/reels", async (req, res) => {
       await buildReelsCache(redis, token, location);
 
       const newCachedReels = await redis.get(cacheKey);
+      console.log(`REELS: Sending newly built list for ${location}.`);
       const data = JSON.parse(newCachedReels || '{"animals":[]}');
       data.animals.sort(() => Math.random() - 0.5);
       return res.json(data);
@@ -213,7 +183,39 @@ app.get("/api/animals", addPetfinderToken, async (req, res) => {
   }
 });
 
+// --- BACKGROUND JOB SCHEDULER ---
+const scheduleReelsWorker = () => {
+  const defaultLocation = "Long Beach, CA";
+
+  cron.schedule("0 * * * *", async () => {
+    console.log(
+      `SCHEDULER: Triggering hourly cache build for ${defaultLocation}.`
+    );
+    try {
+      const token =
+        (await redis.get(PETFINDER_TOKEN_KEY)) || (await fetchPetfinderToken());
+      await buildReelsCache(redis, token, defaultLocation);
+    } catch (error) {
+      console.error("SCHEDULER: Failed to run the reels worker.", error);
+    }
+  });
+
+  console.log(
+    `SERVER START: Running initial cache build for ${defaultLocation}.`
+  );
+  (async () => {
+    try {
+      const token =
+        (await redis.get(PETFINDER_TOKEN_KEY)) || (await fetchPetfinderToken());
+      await buildReelsCache(redis, token, defaultLocation);
+    } catch (error) {
+      console.error("SERVER START: Failed to run initial reels worker.", error);
+    }
+  })();
+};
+
 // --- START THE SERVER ---
 app.listen(port, () => {
-  console.log(`Server listening on http://localhost:${port}`);
+  console.log(`Server listening on port ${port}`);
+  scheduleReelsWorker();
 });
