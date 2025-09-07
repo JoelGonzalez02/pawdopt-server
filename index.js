@@ -90,6 +90,7 @@ app.get("/", (req, res) => {
 
 // Reels endpoint with "wait-and-respond" logic
 app.get("/api/reels", async (req, res) => {
+  console.log("Received request for /api/reels with query:", req.query);
   const { location } = req.query;
   if (!location) {
     return res.status(400).json({ message: "Location parameter is required." });
