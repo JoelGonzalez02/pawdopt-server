@@ -18,7 +18,7 @@ export const buildReelsCache = async (redis, token) => {
     while (animalsForReels.length < 50 && currentPage <= maxPagesToFetch) {
       const response = await axios.get(PETFINDER_API_URL, {
         headers: { Authorization: `Bearer ${token}` },
-        params: { limit: 100, page: currentPage, sort: "recent" }, // No location
+        params: { limit: 100, page: currentPage, sort: "recent" }, // No location parameter
       });
 
       const fetchedAnimals = response.data.animals;

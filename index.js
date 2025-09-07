@@ -88,7 +88,7 @@ app.get("/", (req, res) => {
   res.send("PawBond Server is running!");
 });
 
-// Reels endpoint that serves from one global cache
+// Simple Reels endpoint that serves from one global cache
 app.get("/api/reels", async (req, res) => {
   try {
     const cachedReels = await redis.get("reels:all_animals");
@@ -108,7 +108,7 @@ app.get("/api/reels", async (req, res) => {
 
 // Endpoint for standard animal searches
 app.get("/api/animals", addPetfinderToken, async (req, res) => {
-  // ... (implementation is the same)
+  // ... (implementation remains the same)
 });
 
 // --- BACKGROUND JOB SCHEDULER ---
