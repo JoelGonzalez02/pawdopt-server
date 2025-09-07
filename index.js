@@ -5,8 +5,8 @@ import axios from "axios";
 import dotenv from "dotenv";
 import cors from "cors";
 import querystring from "querystring";
-import cron from "node-cron";
-import { buildReelsCache } from "./worker.js";
+import cron from "node-cron"; // Import the scheduler
+import { buildReelsCache } from "./worker.js"; // Import your worker function
 
 // --- CONFIGURATION ---
 dotenv.config();
@@ -15,14 +15,16 @@ const app = express();
 const port = process.env.PORT || 3000;
 const redis = new Redis(process.env.REDIS_URL);
 
-redis.on("error", (err) => console.error("Redis Client Error", err));
-redis.on("connect", () => console.log("Successfully connected to Redis."));
-
 app.use(cors());
 app.use(express.json());
 
+const REELS_CACHE_KEY = "reels:all_animals";
+
 // --- PETFINDER TOKEN MANAGEMENT ---
-const PETFINDER_TOKEN_KEY = "petfinder_token";
+let petfinderToken = {
+  token: null,
+  expiresAt: 0,
+};
 
 const fetchPetfinderToken = async () => {
   try {
@@ -42,9 +44,10 @@ const fetchPetfinderToken = async () => {
     );
 
     const { access_token, expires_in } = response.data;
-    await redis.set(PETFINDER_TOKEN_KEY, access_token, "EX", expires_in - 60);
+    const expiresAt = Date.now() + expires_in * 1000;
+    petfinderToken = { token: access_token, expiresAt };
 
-    console.log("Successfully fetched and cached new token in Redis.");
+    console.log("Successfully fetched new token.");
     return access_token;
   } catch (error) {
     console.error(
@@ -56,88 +59,96 @@ const fetchPetfinderToken = async () => {
 };
 
 const addPetfinderToken = async (req, res, next) => {
-  try {
-    let token = await redis.get(PETFINDER_TOKEN_KEY);
-    if (!token) {
-      token = await fetchPetfinderToken();
+  if (!petfinderToken.token || Date.now() >= petfinderToken.expiresAt - 60000) {
+    try {
+      await fetchPetfinderToken();
+    } catch (error) {
+      return res
+        .status(500)
+        .json({ message: "Could not authenticate with Petfinder API" });
     }
-    req.petfinderToken = token;
-    next();
-  } catch (error) {
-    return res
-      .status(500)
-      .json({ message: "Could not authenticate with Petfinder API" });
   }
-};
-
-// --- HELPERS ---
-const getCacheKey = (queryParams) => {
-  const sortedKeys = Object.keys(queryParams).sort();
-  if (sortedKeys.length === 0) {
-    return "animals:default";
-  }
-  const sortedParams = sortedKeys
-    .map((key) => `${key}=${queryParams[key]}`)
-    .join("&");
-  return `animals:${sortedParams}`;
+  req.petfinderToken = petfinderToken.token;
+  next();
 };
 
 // --- ROUTES ---
-
 app.get("/", (req, res) => {
   res.send("PawBond Server is running!");
 });
 
-// Simple Reels endpoint that serves from one global cache
-app.get("/api/reels", async (req, res) => {
+app.get("/api/animals", addPetfinderToken, async (req, res) => {
   try {
-    const cachedReels = await redis.get("reels:all_animals");
-    if (cachedReels) {
-      const data = JSON.parse(cachedReels);
-      data.animals.sort(() => Math.random() - 0.5);
-      return res.json(data);
-    } else {
-      console.log("REELS MISS: No pre-compiled list found.");
-      return res.json({ animals: [], message: "Reels are being prepared." });
+    const cacheKey = `animals:${JSON.stringify(req.query)}`;
+    const cachedData = await redis.get(cacheKey);
+
+    if (cachedData) {
+      console.log(`CACHE HIT for key: ${cacheKey}`);
+      return res.json(JSON.parse(cachedData));
     }
+
+    console.log(`CACHE MISS for key: ${cacheKey}`);
+    const petfinderResponse = await axios.get(
+      "https://api.petfinder.com/v2/animals",
+      {
+        headers: { Authorization: `Bearer ${req.petfinderToken}` },
+        params: req.query,
+      }
+    );
+    const data = petfinderResponse.data;
+    await redis.set(cacheKey, JSON.stringify(data), "EX", 600);
+    res.json(data);
   } catch (error) {
-    console.error("Error fetching reels from cache:", error);
-    res.status(500).json({ message: "Could not fetch reels." });
+    console.error(
+      "Error in /api/animals:",
+      error.response?.data || error.message
+    );
+    res
+      .status(500)
+      .json({ message: "An error occurred while fetching animals." });
   }
 });
 
-// Endpoint for standard animal searches
-app.get("/api/animals", addPetfinderToken, async (req, res) => {
-  // ... (implementation remains the same)
+app.get("/api/reels", async (req, res) => {
+  try {
+    const cachedReels = await redis.get(REELS_CACHE_KEY);
+    if (cachedReels) {
+      console.log(`CACHE HIT for key: ${REELS_CACHE_KEY}`);
+      return res.json(JSON.parse(cachedReels));
+    }
+    console.log(
+      `CACHE MISS for key: ${REELS_CACHE_KEY}. The worker may need to run.`
+    );
+    res.json({ animals: [] });
+  } catch (error) {
+    console.error("Error in /api/reels:", error.message);
+    res
+      .status(500)
+      .json({ message: "An error occurred while fetching video reels." });
+  }
 });
 
-// --- BACKGROUND JOB SCHEDULER ---
-const scheduleReelsWorker = () => {
-  cron.schedule("0 * * * *", async () => {
-    console.log("SCHEDULER: Triggering hourly reels cache build.");
-    try {
-      const token =
-        (await redis.get(PETFINDER_TOKEN_KEY)) || (await fetchPetfinderToken());
-      await buildReelsCache(redis, token);
-    } catch (error) {
-      console.error("SCHEDULER: Failed to run the reels worker.", error);
-    }
-  });
+// --- SCHEDULED WORKER & INITIALIZATION ---
 
-  console.log("SERVER START: Running initial reels cache build.");
-  (async () => {
-    try {
-      const token =
-        (await redis.get(PETFINDER_TOKEN_KEY)) || (await fetchPetfinderToken());
-      await buildReelsCache(redis, token);
-    } catch (error) {
-      console.error("SERVER START: Failed to run initial reels worker.", error);
-    }
-  })();
+// Define a single function to run the worker logic
+const runReelsWorker = async () => {
+  console.log("WORKER-RUNNER: Starting the reels cache worker...");
+  try {
+    // A valid token is required for the worker to function
+    const token = await fetchPetfinderToken();
+    await buildReelsCache(redis, token);
+  } catch (error) {
+    console.error("WORKER-RUNNER: Worker task failed:", error.message);
+  }
 };
+
+// Schedule the worker to run every 30 minutes
+cron.schedule("*/30 * * * *", runReelsWorker);
 
 // --- START THE SERVER ---
 app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-  scheduleReelsWorker();
+  console.log(`Server listening on http://localhost:${port}`);
+  // Run the worker once immediately on startup
+  console.log("SERVER STARTUP: Triggering initial run of the reels worker.");
+  runReelsWorker();
 });
