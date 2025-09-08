@@ -1,3 +1,5 @@
+// server.js
+
 // --- IMPORTS ---
 import express from "express";
 import Redis from "ioredis";
@@ -5,8 +7,8 @@ import axios from "axios";
 import dotenv from "dotenv";
 import cors from "cors";
 import querystring from "querystring";
-import cron from "node-cron"; // Import the scheduler
-import { buildReelsCache } from "./worker.js"; // Import your worker function
+import cron from "node-cron";
+import { buildReelsCache, buildReelsForLocation } from "./worker.js";
 
 // --- CONFIGURATION ---
 dotenv.config();
@@ -19,6 +21,7 @@ app.use(cors());
 app.use(express.json());
 
 const REELS_CACHE_KEY = "reels:all_animals";
+const LOCATION_REELS_CACHE_PREFIX = "reels:location:";
 
 // --- PETFINDER TOKEN MANAGEMENT ---
 let petfinderToken = {
@@ -109,46 +112,103 @@ app.get("/api/animals", addPetfinderToken, async (req, res) => {
   }
 });
 
-app.get("/api/reels", async (req, res) => {
+app.post("/api/prewarm-reels", addPetfinderToken, async (req, res) => {
+  const { location } = req.body;
+
+  if (!location) {
+    return res.status(400).json({ message: "Location is required." });
+  }
+
+  const sanitizedLocation = location.split(",").slice(0, 2).join(",").trim();
+  const locationCacheKey = `${LOCATION_REELS_CACHE_PREFIX}${sanitizedLocation}`;
+
   try {
-    const cachedReels = await redis.get(REELS_CACHE_KEY);
-    if (cachedReels) {
-      console.log(`CACHE HIT for key: ${REELS_CACHE_KEY}`);
-      return res.json(JSON.parse(cachedReels));
+    const alreadyCached = await redis.get(locationCacheKey);
+    if (alreadyCached) {
+      console.log(
+        `PRE-WARM: Cache already exists for ${sanitizedLocation}. Skipping.`
+      );
+      return res.status(200).json({ message: "Cache already warm." });
     }
+
+    res.status(202).json({ message: "Reels cache pre-warming initiated." });
+
     console.log(
-      `CACHE MISS for key: ${REELS_CACHE_KEY}. The worker may need to run.`
+      `PRE-WARM: Starting background cache build for ${sanitizedLocation}.`
     );
-    res.json({ animals: [] });
+    buildReelsForLocation(redis, req.petfinderToken, sanitizedLocation);
+  } catch (error) {
+    console.error("Error during pre-warm request:", error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ message: "Internal server error." });
+    }
+  }
+});
+
+app.get("/api/reels", addPetfinderToken, async (req, res) => {
+  const { location } = req.query;
+
+  try {
+    if (location) {
+      const sanitizedLocation = location
+        .split(",")
+        .slice(0, 2)
+        .join(",")
+        .trim();
+      console.log(
+        `Handling "For You" request for location: "${sanitizedLocation}"`
+      );
+      const locationCacheKey = `${LOCATION_REELS_CACHE_PREFIX}${sanitizedLocation}`;
+
+      const cachedReels = await redis.get(locationCacheKey);
+      if (cachedReels) {
+        console.log(`CACHE HIT for location: ${sanitizedLocation}`);
+        return res.json(JSON.parse(cachedReels));
+      }
+
+      console.log(
+        `CACHE MISS for location: ${sanitizedLocation}. Building now...`
+      );
+      const newReels = await buildReelsForLocation(
+        redis,
+        req.petfinderToken,
+        sanitizedLocation
+      );
+      return res.json({ animals: newReels });
+    } else {
+      console.log('Handling "All" reels request.');
+      const cachedReels = await redis.get(REELS_CACHE_KEY);
+      if (cachedReels) {
+        console.log(`CACHE HIT for generic reels.`);
+        return res.json(JSON.parse(cachedReels));
+      }
+
+      console.log(`CACHE MISS for generic reels. Returning empty array.`);
+      return res.json({ animals: [] });
+    }
   } catch (error) {
     console.error("Error in /api/reels:", error.message);
-    res
+    return res
       .status(500)
       .json({ message: "An error occurred while fetching video reels." });
   }
 });
 
 // --- SCHEDULED WORKER & INITIALIZATION ---
-
-// Define a single function to run the worker logic
-const runReelsWorker = async () => {
-  console.log("WORKER-RUNNER: Starting the reels cache worker...");
+const runGenericReelsWorker = async () => {
+  console.log("WORKER-RUNNER: Starting the generic reels cache worker...");
   try {
-    // A valid token is required for the worker to function
     const token = await fetchPetfinderToken();
     await buildReelsCache(redis, token);
   } catch (error) {
-    console.error("WORKER-RUNNER: Worker task failed:", error.message);
+    console.error("WORKER-RUNNER: Generic worker task failed:", error.message);
   }
 };
 
-// Schedule the worker to run every 30 minutes
-cron.schedule("*/30 * * * *", runReelsWorker);
+cron.schedule("*/30 * * * *", runGenericReelsWorker);
 
 // --- START THE SERVER ---
 app.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
-  // Run the worker once immediately on startup
-  console.log("SERVER STARTUP: Triggering initial run of the reels worker.");
-  runReelsWorker();
+  runGenericReelsWorker();
 });
