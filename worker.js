@@ -3,8 +3,9 @@
 import axios from "axios";
 
 const PETFINDER_API_URL = "https://api.petfinder.com/v2/animals";
-const REELS_CACHE_KEY = "reels:all_animals"; // For the "All" tab
-const LOCATION_REELS_CACHE_PREFIX = "reels:location:"; // For the "For You" tab
+
+// Helper function to add a delay
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Helper function to extract a non-YouTube video URL
 const extractVideoUrl = (embed) => {
@@ -16,96 +17,111 @@ const extractVideoUrl = (embed) => {
   return null;
 };
 
-/**
- * A generic function to fetch and filter animals with videos from Petfinder.
- * @param {string} token - The Petfinder API token.
- * @param {object} params - The query parameters for the Petfinder API (e.g., location).
- * @returns {Promise<Array>} - A promise that resolves to an array of animal objects.
- */
-const fetchAndFilterAnimals = async (token, params) => {
+// Internal helper function to fetch and filter animals that have videos
+const fetchAnimalsWithVideos = async (token, params, fetchLimit) => {
   let animalsForReels = [];
   let currentPage = 1;
-  const maxPagesToFetch = 10; // Reduced pages for faster on-demand fetching
+  const { pages: maxPagesToFetch, count: targetAnimalCount } = fetchLimit;
 
-  while (animalsForReels.length < 50 && currentPage <= maxPagesToFetch) {
-    const response = await axios.get(PETFINDER_API_URL, {
-      headers: { Authorization: `Bearer ${token}` },
-      params: {
-        limit: 100,
-        page: currentPage,
-        sort: "recent",
-        ...params, // Spread the incoming params (this is where location will go)
-      },
-    });
+  while (
+    animalsForReels.length < targetAnimalCount &&
+    currentPage <= maxPagesToFetch
+  ) {
+    try {
+      const response = await axios.get(PETFINDER_API_URL, {
+        headers: { Authorization: `Bearer ${token}` },
+        params: { limit: 100, page: currentPage, ...params },
+      });
 
-    const fetchedAnimals = response.data.animals;
-    if (!fetchedAnimals || fetchedAnimals.length === 0) {
-      break;
+      const fetchedAnimals = response.data.animals;
+      if (!fetchedAnimals || fetchedAnimals.length === 0) {
+        break; // No more results from the API
+      }
+
+      const filtered = fetchedAnimals.filter(
+        (animal) =>
+          animal.videos &&
+          animal.videos.some((video) => extractVideoUrl(video.embed))
+      );
+
+      if (filtered.length > 0) {
+        animalsForReels.push(...filtered);
+      }
+
+      await sleep(250); // Pace requests
+      currentPage++;
+    } catch (error) {
+      // Handle 429 Rate Limit error specifically if needed, otherwise break
+      if (error.response && error.response.status === 429) {
+        console.warn("RATE LIMIT: Hit rate limit, pausing fetch loop.");
+        await sleep(5000); // Wait 5 seconds before trying next page
+      } else {
+        console.error("WORKER: Error fetching page:", error.message);
+        break; // Exit loop on other errors
+      }
     }
-
-    const filtered = fetchedAnimals.filter(
-      (animal) =>
-        animal.videos &&
-        animal.videos.some((video) => extractVideoUrl(video.embed))
-    );
-
-    animalsForReels.push(...filtered);
-    currentPage++;
   }
-
   return animalsForReels;
 };
 
-// This original function now just handles the generic "All" reels
-export const buildReelsCache = async (redis, token) => {
-  console.log("WORKER: Starting job for generic reels...");
-  try {
-    const animalsForReels = await fetchAndFilterAnimals(token, {}); // No specific params
-    await redis.set(
-      REELS_CACHE_KEY,
-      JSON.stringify({ animals: animalsForReels })
-    );
-    console.log(
-      `WORKER: Successfully updated generic Reels cache with ${animalsForReels.length} animals.`
-    );
-  } catch (error) {
-    console.error(
-      "WORKER: Error building generic reels cache:",
-      error.response?.data || error.message
+// The primary worker function that builds a "Feed Unit" based on a context
+export const buildFeedUnit = async (redis, token, options) => {
+  const { context, location, distance, type } = options;
+  const cacheKey = `feed:${context}:${location}:${distance}:${type || "all"}`;
+  let feedAnimals = [];
+
+  console.log(
+    `WORKER: Building Feed Unit for context: ${context}, Location: ${location}, Type: ${
+      type || "All"
+    }`
+  );
+
+  if (context === "forYou" || context === "dogs" || context === "cats") {
+    const primaryParams = {
+      location,
+      distance,
+      sort: "distance",
+      type: type || undefined,
+    };
+    const randomParams = { sort: "random", type: type || undefined };
+
+    // Fetch a large base of relevant, local animals
+    const primaryAnimals = await fetchAnimalsWithVideos(token, primaryParams, {
+      pages: 40,
+      count: 80,
+    });
+    // Fetch a smaller, random batch for variety
+    const randomAnimals = await fetchAnimalsWithVideos(token, randomParams, {
+      pages: 10,
+      count: 20,
+    });
+
+    const primaryIds = new Set(primaryAnimals.map((a) => a.id));
+    const uniqueRandom = randomAnimals.filter((a) => !primaryIds.has(a.id));
+
+    feedAnimals = [...primaryAnimals, ...uniqueRandom];
+
+    // Shuffle the final blended feed
+    for (let i = feedAnimals.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [feedAnimals[i], feedAnimals[j]] = [feedAnimals[j], feedAnimals[i]];
+    }
+  } else {
+    // Default to "discover" context
+    feedAnimals = await fetchAnimalsWithVideos(
+      token,
+      { sort: "random" },
+      { pages: 80, count: 150 }
     );
   }
-};
 
-/**
- * Fetches and caches reels for a specific location ON-DEMAND.
- * @param {Redis} redis - The Redis client instance.
- * @param {string} token - The Petfinder API token.
- * @param {string} location - The user's location (e.g., "90023" or "Los Angeles, CA").
- * @returns {Promise<Array>} - A promise that resolves to the array of animals for that location.
- */
-export const buildReelsForLocation = async (redis, token, location) => {
-  console.log(`WORKER-ON-DEMAND: Building reels for location: ${location}`);
-  try {
-    const animalsForReels = await fetchAndFilterAnimals(token, { location });
-    const cacheKey = `${LOCATION_REELS_CACHE_PREFIX}${location}`;
-
-    // Cache the location-specific results with a 30-minute expiry
-    await redis.set(
-      cacheKey,
-      JSON.stringify({ animals: animalsForReels }),
-      "EX",
-      1800 // 30 minutes
-    );
-
-    console.log(
-      `WORKER-ON-DEMAND: Successfully cached ${animalsForReels.length} reels for ${location}.`
-    );
-    return animalsForReels;
-  } catch (error) {
-    console.error(
-      `WORKER-ON-DEMAND: Error building reels for ${location}:`,
-      error.response?.data || error.message
-    );
-    return []; // Return an empty array on error
-  }
+  await redis.set(
+    cacheKey,
+    JSON.stringify({ animals: feedAnimals }),
+    "EX",
+    3600
+  ); // Cache for 1 hour
+  console.log(
+    `WORKER: Cached ${feedAnimals.length} animals for key: ${cacheKey}`
+  );
 };
