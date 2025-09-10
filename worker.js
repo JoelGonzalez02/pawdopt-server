@@ -76,7 +76,7 @@ export const buildFeedUnit = async (redis, token, options) => {
     }`
   );
 
-  if (context === "forYou" || context === "dogs" || context === "cats") {
+  if (context === "forYou") {
     const primaryParams = {
       location,
       distance,
@@ -106,13 +106,6 @@ export const buildFeedUnit = async (redis, token, options) => {
       const j = Math.floor(Math.random() * (i + 1));
       [feedAnimals[i], feedAnimals[j]] = [feedAnimals[j], feedAnimals[i]];
     }
-  } else {
-    // Default to "discover" context
-    feedAnimals = await fetchAnimalsWithVideos(
-      token,
-      { sort: "random" },
-      { pages: 80, count: 150 }
-    );
   }
 
   await redis.set(

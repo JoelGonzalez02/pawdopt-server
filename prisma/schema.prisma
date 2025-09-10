@@ -1,0 +1,31 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Model for an anonymous user
+model User {
+  id         Int         @id @default(autoincrement())
+  uuid       String      @unique
+  createdAt  DateTime    @default(now()) @map("created_at")
+  seenVideos SeenVideo[]
+
+  @@map("users")
+}
+
+// Model to track which videos a user has seen
+model SeenVideo {
+  userId    Int      @map("user_id")
+  animalId  Int      @map("animal_id")
+  seenAt    DateTime @default(now()) @map("seen_at")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, animalId])
+  @@map("seen_videos")
+}

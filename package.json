@@ -13,6 +13,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@prisma/client": "^6.15.0",
     "axios": "^1.11.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
@@ -20,5 +21,7 @@
     "ioredis": "^5.7.0",
     "node-cron": "^4.2.1"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "prisma": "^6.15.0"
+  }
 }

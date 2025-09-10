@@ -98,7 +98,7 @@ app.get("/api/animals", addPetfinderToken, async (req, res) => {
 });
 
 // Intelligent endpoint for the Reels screen
-app.get("/api/feed", addPetfinderToken, async (req, res) => {
+app.get("/api/next-videos", addPetfinderToken, async (req, res) => {
   const { context, page = 1, location, distance, type } = req.query;
   const pageSize = 10;
 
@@ -138,7 +138,7 @@ app.get("/api/feed", addPetfinderToken, async (req, res) => {
       totalPages: Math.ceil(totalAnimals / pageSize),
     });
   } catch (error) {
-    console.error("Error in /api/feed:", error.message);
+    console.error("Error in /api/next-videos:", error.message);
     res.status(500).json({ message: "Failed to get feed." });
   }
 });
@@ -148,7 +148,7 @@ const warmPopularFeeds = async () => {
   console.log("CRON: Proactively warming popular feeds...");
   try {
     const token = await fetchPetfinderToken();
-    await buildFeedUnit(redis, token, { context: "discover" });
+    await buildFeedUnit(redis, token, { context: "forYou" });
     // This could be expanded to include popular locations as well
   } catch (error) {
     console.error("CRON: Failed to warm popular feeds:", error.message);
@@ -160,5 +160,4 @@ cron.schedule("0 * * * *", warmPopularFeeds); // Run once an hour
 // --- START THE SERVER ---
 app.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
-  warmPopularFeeds(); // Warm the Discover feed on initial startup
 });
