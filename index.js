@@ -1,19 +1,15 @@
-// server.js
-
 // --- IMPORTS ---
 import express from "express";
-import Redis from "ioredis";
 import dotenv from "dotenv";
-import cron from "node-cron";
 import axios from "axios";
 import querystring from "querystring";
-import { buildFeedUnit } from "./worker.js";
+import { PrismaClient } from "@prisma/client";
 
 // --- CONFIGURATION ---
 dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
-const redis = new Redis(process.env.REDIS_URL);
+const prisma = new PrismaClient();
 app.use(express.json());
 
 // --- PETFINDER TOKEN MANAGEMENT ---
@@ -67,11 +63,6 @@ app.get("/", (req, res) => res.send("Pawadopt Server is running!"));
 // Main endpoint for the discovery/swipe card screen
 app.get("/api/animals", addPetfinderToken, async (req, res) => {
   try {
-    const cacheKey = `animals:${JSON.stringify(req.query)}`;
-    const cachedData = await redis.get(cacheKey);
-    if (cachedData) {
-      return res.json(JSON.parse(cachedData));
-    }
     const petfinderResponse = await axios.get(
       "https://api.petfinder.com/v2/animals",
       {
@@ -79,12 +70,6 @@ app.get("/api/animals", addPetfinderToken, async (req, res) => {
         params: req.query,
       }
     );
-    await redis.set(
-      cacheKey,
-      JSON.stringify(petfinderResponse.data),
-      "EX",
-      600
-    ); // 10-minute cache
     res.json(petfinderResponse.data);
   } catch (error) {
     console.error(
@@ -97,67 +82,54 @@ app.get("/api/animals", addPetfinderToken, async (req, res) => {
   }
 });
 
-// Intelligent endpoint for the Reels screen
-app.get("/api/next-videos", addPetfinderToken, async (req, res) => {
-  const { context, page = 1, location, distance, type } = req.query;
-  const pageSize = 10;
+// The new, intelligent "Smart Feed" endpoint
+app.post("/api/next-videos", async (req, res) => {
+  const { location, distance } = req.body;
+  const BATCH_SIZE = 10;
 
-  const cacheKey = `feed:${context}:${location}:${distance}:${type || "all"}`;
-  const lockKey = `lock:${cacheKey}`;
+  if (!location) {
+    return res.status(400).json({ message: "Location is required." });
+  }
 
   try {
-    let feedUnitData = await redis.get(cacheKey);
+    // 1. Fetch local animals
+    const [city, state] = location.split(",").map((s) => s.trim());
+    const localAnimals = await prisma.animalWithVideo.findMany({
+      where: { city, state },
+      take: 50, // Fetch a good-sized batch of local options
+    });
 
-    if (!feedUnitData) {
-      const lock = await redis.get(lockKey);
-      if (lock) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        feedUnitData = await redis.get(cacheKey);
-      } else {
-        await redis.set(lockKey, "1", "EX", 60);
-        await buildFeedUnit(redis, req.petfinderToken, {
-          context,
-          location,
-          distance,
-          type,
-        });
-        feedUnitData = await redis.get(cacheKey);
-      }
+    // 2. Fetch random nationwide animals
+    const totalCount = await prisma.animalWithVideo.count();
+    const skip = Math.max(0, Math.floor(Math.random() * totalCount) - 20);
+    const randomAnimals = await prisma.animalWithVideo.findMany({
+      skip: skip < 0 ? 0 : skip,
+      take: 20, // Fetch a smaller batch for variety
+    });
+
+    // 3. Blend the two lists and remove duplicates
+    const localIds = new Set(localAnimals.map((a) => a.id));
+    const uniqueRandom = randomAnimals.filter((a) => !localIds.has(a.id));
+    let blendedFeed = [...localAnimals, ...uniqueRandom];
+
+    // 4. Shuffle the final blended feed
+    for (let i = blendedFeed.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [blendedFeed[i], blendedFeed[j]] = [blendedFeed[j], blendedFeed[i]];
     }
 
-    const feedUnit = JSON.parse(feedUnitData || '{"animals":[]}');
-    const totalAnimals = feedUnit.animals.length;
-    const startIndex = (page - 1) * pageSize;
-    const paginatedAnimals = feedUnit.animals.slice(
-      startIndex,
-      startIndex + pageSize
-    );
+    // 5. Serve the next batch of videos
+    const nextBatch = blendedFeed
+      .slice(0, BATCH_SIZE)
+      .map((animal) => animal.rawJson);
 
-    res.json({
-      animals: paginatedAnimals,
-      totalPages: Math.ceil(totalAnimals / pageSize),
-    });
+    res.json({ animals: nextBatch });
   } catch (error) {
-    console.error("Error in /api/next-videos:", error.message);
-    res.status(500).json({ message: "Failed to get feed." });
+    console.error("Error in /api/next-videos:", error);
+    res.status(500).json({ message: "Failed to get next videos." });
   }
 });
 
-// --- SCHEDULED WORKER ---
-const warmPopularFeeds = async () => {
-  console.log("CRON: Proactively warming popular feeds...");
-  try {
-    const token = await fetchPetfinderToken();
-    await buildFeedUnit(redis, token, { context: "forYou" });
-    // This could be expanded to include popular locations as well
-  } catch (error) {
-    console.error("CRON: Failed to warm popular feeds:", error.message);
-  }
-};
-
-cron.schedule("0 * * * *", warmPopularFeeds); // Run once an hour
-
-// --- START THE SERVER ---
 app.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
 });
