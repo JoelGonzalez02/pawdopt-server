@@ -11,19 +11,15 @@ datasource db {
 
 // Model for the data from your scanner
 model AnimalWithVideo {
-  id        Int       @id
-  name      String?
-  type      String?
-  gender    String?
-  breed     String?
-  city      String?
-  state     String?
-  videoUrl  String
-  rawJson   Json
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  id         Int      @id
+  city       String
+  state      String
+  animalType String
+  rawJson    Json
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @updatedAt
 
-  @@map("animals_with_videos")
+  @@index([city, state, animalType])
 }
 
 // Model for an anonymous user
