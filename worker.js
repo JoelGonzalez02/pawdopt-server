@@ -11,39 +11,40 @@ dotenv.config();
 const PETFINDER_API_URL = "https://api.petfinder.com/v2/animals";
 const PAGE_LIMIT = 100;
 const SCAN_RADIUS_MILES = 150;
-// This target is calibrated for an 8x-per-day run to stay under 1,000 API calls.
 const TARGET_PER_HUB = 40;
 
 const CITY_HUBS = [
-  "Boston, MA",
-  "New York, NY",
-  "Philadelphia, PA",
-  "Pittsburgh, PA",
-  "Washington, DC",
-  "Charlotte, NC",
-  "Atlanta, GA",
-  "Orlando, FL",
-  "Miami, FL",
-  "Nashville, TN",
-  "Indianapolis, IN",
-  "Detroit, MI",
-  "Chicago, IL",
-  "Minneapolis, MN",
-  "St. Louis, MO",
-  "Kansas City, MO",
-  "Dallas, TX",
-  "Houston, TX",
-  "San Antonio, TX",
-  "Denver, CO",
-  "Salt Lake City, UT",
-  "Phoenix, AZ",
-  "Las Vegas, NV",
   "Seattle, WA",
   "Portland, OR",
   "Sacramento, CA",
   "San Francisco, CA",
   "Los Angeles, CA",
   "San Diego, CA",
+  "Las Vegas, NV",
+  "Phoenix, AZ",
+  "Salt Lake City, UT",
+  "Denver, CO",
+  "Dallas, TX",
+  "Houston, TX",
+  "San Antonio, TX",
+  "New Orleans, LA",
+  "Oklahoma City, OK",
+  "Kansas City, MO",
+  "St. Louis, MO",
+  "Minneapolis, MN",
+  "Chicago, IL",
+  "Indianapolis, IN",
+  "Detroit, MI",
+  "Nashville, TN",
+  "Atlanta, GA",
+  "Charlotte, NC",
+  "Orlando, FL",
+  "Miami, FL",
+  "Pittsburgh, PA",
+  "Washington, DC",
+  "Philadelphia, PA",
+  "New York, NY",
+  "Boston, MA",
 ];
 const CITY_COORDS_CACHE_KEY = "worker:coords";
 
@@ -86,16 +87,27 @@ const getValidToken = async () => {
 
 // --- HELPER FUNCTIONS ---
 const getPlayableVideoUrl = (animal) => {
-  if (!animal.videos || animal.videos.length === 0 || !animal.videos[0].embed)
+  if (
+    !animal.videos ||
+    !Array.isArray(animal.videos) ||
+    animal.videos.length === 0
+  )
     return null;
-  const match = animal.videos[0].embed.match(/src="([^"]+)"/);
-  return match ? match[1] : null;
+  const embed = animal.videos[0].embed;
+  if (!embed || typeof embed !== "string") return null;
+  const match = embed.match(/src="([^"]+)"/);
+  const url = match ? match[1] : null;
+  if (!url) return null;
+  const isBlocked =
+    url.includes("youtube.com") ||
+    url.includes("vimeo.com") ||
+    url.includes("facebook.com");
+  return isBlocked ? null : url;
 };
 
 const getCityCoordinates = async (city) => {
   const cachedCoords = await redis.hget(CITY_COORDS_CACHE_KEY, city);
   if (cachedCoords) return JSON.parse(cachedCoords);
-
   console.log(`WORKER: Geocoding ${city}...`);
   const data = await opencage.geocode({
     q: city,
@@ -111,7 +123,7 @@ const getCityCoordinates = async (city) => {
 
 const pruneStaleAnimals = async () => {
   console.log("WORKER: Pruning stale animal records...");
-  const cutoffDate = new Date(Date.now() - 25 * 60 * 60 * 1000); // 25 hours ago
+  const cutoffDate = new Date(Date.now() - 25 * 60 * 60 * 1000);
   const { count } = await prisma.animalWithVideo.deleteMany({
     where: { lastSeenAt: { lt: cutoffDate } },
   });
@@ -156,20 +168,74 @@ const runWorker = async () => {
           if (newAnimalsFoundInHub >= TARGET_PER_HUB) break;
           if (!getPlayableVideoUrl(animal)) continue;
 
+          let latitude = null;
+          let longitude = null;
+          const address = animal.contact.address;
+
+          try {
+            if (address && address.city && address.state) {
+              const fullAddress = `${address.address1 || ""}, ${
+                address.city
+              }, ${address.state} ${address.postcode || ""}`;
+              const geoData = await opencage.geocode({
+                q: fullAddress,
+                key: process.env.OPENCAGE_API_KEY,
+              });
+              if (geoData.results.length > 0) {
+                latitude = geoData.results[0].geometry.lat;
+                longitude = geoData.results[0].geometry.lng;
+              }
+            }
+          } catch (geoError) {
+            console.error(
+              `WORKER: Could not geocode address for animal ${animal.id}: ${geoError.message}`
+            );
+          }
+
+          // --- CORRECTED DATA MAPPING TO MATCH OPTIMIZED SCHEMA ---
           await prisma.animalWithVideo.upsert({
             where: { id: animal.id },
             update: {
+              name: animal.name,
+              url: animal.url,
+              type: animal.type,
+              age: animal.age,
+              gender: animal.gender,
+              size: animal.size,
+              status: animal.status,
+              breeds: animal.breeds,
+              colors: animal.colors,
+              photos: animal.photos,
+              videos: animal.videos,
+              contact: animal.contact,
+              attributes: animal.attributes, // <-- Add this line
+              environment: animal.environment,
               city: animal.contact.address.city,
               state: animal.contact.address.state,
-              animalType: animal.type,
-              rawJson: animal,
+              latitude: latitude,
+              longitude: longitude,
             },
             create: {
               id: animal.id,
+              name: animal.name,
+              url: animal.url,
+              type: animal.type,
+              age: animal.age,
+              gender: animal.gender,
+              size: animal.size,
+              status: animal.status,
+              breeds: animal.breeds,
+              colors: animal.colors,
+              photos: animal.photos,
+              videos: animal.videos,
+              contact: animal.contact,
+              attributes: animal.attributes, // <-- Add this line
+              environment: animal.environment,
               city: animal.contact.address.city,
               state: animal.contact.address.state,
-              animalType: animal.type,
-              rawJson: animal,
+              latitude: latitude,
+              longitude: longitude,
+              likeCount: 0, // Set initial like count for new animals
             },
           });
           newAnimalsFoundInHub++;
@@ -178,7 +244,6 @@ const runWorker = async () => {
         console.log(
           `WORKER: [${city}] Progress: ${newAnimalsFoundInHub}/${TARGET_PER_HUB} animals found.`
         );
-
         if (pagination && currentPage < pagination.total_pages) {
           currentPage++;
         } else {

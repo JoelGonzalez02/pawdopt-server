@@ -5,7 +5,8 @@ import axios from "axios";
 import dotenv from "dotenv";
 import querystring from "querystring";
 import { PrismaClient } from "@prisma/client";
-import { randomUUID } from "crypto"; // For generating unique session IDs
+import { randomUUID } from "crypto";
+import opencage from "opencage-api-client";
 
 // --- CONFIGURATION ---
 dotenv.config();
@@ -19,6 +20,33 @@ const redis = new Redis(process.env.REDIS_URL);
 redis.on("error", (err) => console.error("Redis Client Error", err));
 redis.on("connect", () => console.log("🚀 Successfully connected to Redis."));
 
+// --- HELPER FUNCTIONS ---
+const getUserCoordinates = async (location) => {
+  const sanitizedLocation = location.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const cacheKey = `coords:${sanitizedLocation}`;
+
+  const cachedCoords = await redis.get(cacheKey);
+  if (cachedCoords) {
+    console.log(`Cache HIT for coordinates: ${location}`);
+    return JSON.parse(cachedCoords);
+  }
+
+  console.log(`Cache MISS for coordinates: ${location}. Calling OpenCage API.`);
+  const geoData = await opencage.geocode({
+    q: location,
+    key: process.env.OPENCAGE_API_KEY,
+  });
+  if (!geoData.results || geoData.results.length === 0) {
+    throw new Error(`Could not determine coordinates for ${location}`);
+  }
+
+  const { lat, lng } = geoData.results[0].geometry;
+  const coords = { lat, lon: lng };
+
+  await redis.set(cacheKey, JSON.stringify(coords), "EX", 60 * 60 * 24 * 30);
+  return coords;
+};
+
 // --- PETFINDER TOKEN MANAGEMENT ---
 let petfinderToken = { token: null, expiresAt: 0 };
 
@@ -31,15 +59,13 @@ const fetchPetfinderToken = async () => {
         grant_type: "client_credentials",
         client_id: process.env.PETFINDER_CLIENT_ID,
         client_secret: process.env.PETFINDER_CLIENT_SECRET,
-      }),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+      })
     );
     const { access_token, expires_in } = response.data;
     petfinderToken = {
       token: access_token,
       expiresAt: Date.now() + (expires_in - 60) * 1000,
     };
-    console.log("Successfully fetched new token.");
     return petfinderToken.token;
   } catch (error) {
     console.error(
@@ -67,22 +93,15 @@ const addPetfinderToken = async (req, res, next) => {
 // --- ROUTES ---
 app.get("/", (req, res) => res.send("Pawadopt Server is running!"));
 
-/**
- * Main endpoint for the discovery/swipe card screen with caching.
- */
 app.get("/api/animals", addPetfinderToken, async (req, res) => {
   const cacheKey = `animals:${querystring.stringify(req.query)}`;
   try {
     const cachedData = await redis.get(cacheKey);
     if (cachedData) {
-      console.log(`Cache HIT for discovery: ${cacheKey}`);
       res.setHeader("X-Cache", "HIT");
       return res.json(JSON.parse(cachedData));
     }
-
-    console.log(`Cache MISS for discovery: ${cacheKey}`);
     res.setHeader("X-Cache", "MISS");
-
     const petfinderResponse = await axios.get(
       "https://api.petfinder.com/v2/animals",
       {
@@ -90,7 +109,6 @@ app.get("/api/animals", addPetfinderToken, async (req, res) => {
         params: req.query,
       }
     );
-
     await redis.set(
       cacheKey,
       JSON.stringify(petfinderResponse.data),
@@ -109,9 +127,6 @@ app.get("/api/animals", addPetfinderToken, async (req, res) => {
   }
 });
 
-/**
- * The intelligent video reels endpoint using a stateful session model.
- */
 app.post("/api/videos", async (req, res) => {
   const { location, page = 1, sessionId } = req.body;
   const PAGE_SIZE = 10;
@@ -133,8 +148,7 @@ app.post("/api/videos", async (req, res) => {
       }
 
       const animalIds = JSON.parse(animalIdsJson);
-      const totalItems = animalIds.length;
-      const totalPages = Math.ceil(totalItems / PAGE_SIZE);
+      const totalPages = Math.ceil(animalIds.length / PAGE_SIZE);
       const pageIds = animalIds.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
       if (pageIds.length === 0) {
@@ -148,7 +162,7 @@ app.post("/api/videos", async (req, res) => {
         where: { id: { in: pageIds } },
       });
       const orderedAnimals = pageIds
-        .map((id) => animalsData.find((a) => a.id === id)?.rawJson)
+        .map((id) => animalsData.find((a) => a.id === id))
         .filter(Boolean);
 
       return res.json({
@@ -157,48 +171,67 @@ app.post("/api/videos", async (req, res) => {
       });
     }
 
-    // PATH 2: No session, create a new one (for Page 1)
-    // PATH 2: No session, create a new one (for Page 1)
-    const [city, state] = location.split(",").map((s) => s.trim());
-    let candidates = await prisma.animalWithVideo.findMany({
-      where: { state: state }, // <--- Query by state for a broader, more relevant pool
-      take: 500, // Take a larger pool since we are searching the whole state
-    });
+    // PATH 2: No session, create one with the egress-optimized query
+    console.log(`Creating new session for location: ${location}`);
+    const coords = await getUserCoordinates(location);
+    const userLat = coords.lat;
+    const userLon = coords.lon;
+    const searchRadiusMiles = 150;
 
-    if (candidates.length < 50) {
+    const candidateIdsResult = await prisma.$queryRaw`
+      SELECT id FROM "AnimalWithVideo"
+      WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND
+        (6371 * acos(cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude)))) < ${
+      searchRadiusMiles * 1.60934
+    }
+      LIMIT 200;
+    `;
+
+    let candidateIds = candidateIdsResult.map((c) => c.id);
+
+    if (candidateIds.length < 50) {
       const randomNationwide = await prisma.animalWithVideo.findMany({
         take: 50,
+        select: { id: true },
       });
-      const existingIds = new Set(candidates.map((c) => c.id));
+      const existingIds = new Set(candidateIds);
       for (const animal of randomNationwide) {
-        if (!existingIds.has(animal.id)) candidates.push(animal);
+        if (!existingIds.has(animal.id)) candidateIds.push(animal.id);
       }
     }
 
-    // Shuffle the candidates
-    for (let i = candidates.length - 1; i > 0; i--) {
+    for (let i = candidateIds.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+      [candidateIds[i], candidateIds[j]] = [candidateIds[j], candidateIds[i]];
     }
 
     const newSessionId = randomUUID();
-    const animalIds = candidates.map((c) => c.id);
-
-    // Store the full "playlist" of IDs in Redis for 2 hours
     await redis.set(
       `session:${newSessionId}`,
-      JSON.stringify(animalIds),
+      JSON.stringify(candidateIds),
       "EX",
       7200
     );
 
-    const totalPages = Math.ceil(animalIds.length / PAGE_SIZE);
-    const pageData = candidates
-      .slice(0, PAGE_SIZE)
-      .map((animal) => animal.rawJson);
+    const totalPages = Math.ceil(candidateIds.length / PAGE_SIZE);
+    const pageIds = candidateIds.slice(0, PAGE_SIZE);
+
+    if (pageIds.length === 0) {
+      return res.json({
+        animals: [],
+        pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
+      });
+    }
+
+    const pageData = await prisma.animalWithVideo.findMany({
+      where: { id: { in: pageIds } },
+    });
+    const orderedAnimals = pageIds
+      .map((id) => pageData.find((a) => a.id === id))
+      .filter(Boolean);
 
     res.json({
-      animals: pageData,
+      animals: orderedAnimals,
       pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
     });
   } catch (error) {
@@ -207,9 +240,6 @@ app.post("/api/videos", async (req, res) => {
   }
 });
 
-/**
- * Endpoint to get details for a single animal.
- */
 app.get("/api/animal/:id", async (req, res) => {
   const { id } = req.params;
   const animalId = parseInt(id);
@@ -221,30 +251,51 @@ app.get("/api/animal/:id", async (req, res) => {
   try {
     const cachedAnimal = await redis.get(cacheKey);
     if (cachedAnimal) {
-      console.log(`Cache HIT for animal: ${animalId}`);
       res.setHeader("X-Cache", "HIT");
       return res.json(JSON.parse(cachedAnimal));
     }
 
-    console.log(`Cache MISS for animal: ${animalId}`);
     res.setHeader("X-Cache", "MISS");
-
     const animal = await prisma.animalWithVideo.findUnique({
       where: { id: animalId },
     });
-    const finalData = animal ? animal.rawJson : null;
-
-    if (!finalData) {
+    if (!animal) {
       return res
         .status(404)
         .json({ message: "Animal not found in our video database." });
     }
 
-    await redis.set(cacheKey, JSON.stringify(finalData), "EX", 21600);
-    res.json(finalData);
+    await redis.set(cacheKey, JSON.stringify(animal), "EX", 21600);
+    res.json(animal);
   } catch (error) {
     console.error(`Error fetching animal ${id}:`, error);
     res.status(500).json({ message: "An error occurred." });
+  }
+});
+
+app.post("/api/animal/:id/like", async (req, res) => {
+  const { id } = req.params;
+  const { action } = req.body; // Expect 'like' or 'unlike'
+  const animalId = parseInt(id);
+
+  if (isNaN(animalId) || !["like", "unlike"].includes(action)) {
+    return res.status(400).json({ message: "Invalid request." });
+  }
+
+  try {
+    const updatedAnimal = await prisma.animalWithVideo.update({
+      where: { id: animalId },
+      data: {
+        // Conditionally create the correct object with only one key
+        likeCount: action === "like" ? { increment: 1 } : { decrement: 1 },
+      },
+      select: { likeCount: true },
+    });
+
+    res.json({ newLikeCount: updatedAnimal.likeCount });
+  } catch (error) {
+    console.error(`Error updating like count for animal ${id}:`, error);
+    res.status(500).json({ message: "Could not update like count." });
   }
 });
 

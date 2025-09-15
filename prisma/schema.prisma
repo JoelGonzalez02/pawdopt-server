@@ -11,15 +11,35 @@ datasource db {
 
 // Model for the data from your scanner
 model AnimalWithVideo {
-  id         Int      @id
+  id     Int    @id
+  // --- ADD THESE FIELDS BACK ---
+  name   String
+  url    String
+  type   String // This was the old name, let's keep it consistent
+  age    String
+  gender String
+  size   String
+  status String
+  likeCount   Int      @default(0)
+
+  // Store complex objects as JSON
+  breeds  Json
+  colors  Json
+  photos  Json
+  videos  Json
+  contact Json
+  attributes  Json @default("{}")
+  environment Json @default("{}")
+
+  // Location and Timestamps
   city       String
   state      String
-  animalType String
-  rawJson    Json
+  latitude   Float?
+  longitude  Float?
   createdAt  DateTime @default(now())
   lastSeenAt DateTime @updatedAt
 
-  @@index([city, state, animalType])
+  @@index([city, state, type]) // Use 'type' to match the field name
 }
 
 // Model for an anonymous user
