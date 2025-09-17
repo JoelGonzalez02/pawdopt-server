@@ -2,13 +2,9 @@
  * Pawadopt Deep Refresh Worker
  * ----------------------------
  * This script is a long-running service that runs once every 24 hours.
- * Its two jobs are:
- * 1. Prune stale data (animals > 24h old, orgs with no animals).
- * 2. Refresh the `lastSeenAt` timestamp of active animals to prevent them
- * from being pruned.
+ * It performs a two-phase refresh to ensure data accuracy and compliance.
  *
  * How to run:
- * In development: node deep-refresh-worker.js
  * In production: pm2 start deep-refresh-worker.js --name="deep-refresh"
  */
 
@@ -26,8 +22,8 @@ dotenv.config();
 const PETFINDER_API_URL = "https://api.petfinder.com/v2/animals";
 const PAGE_LIMIT = 100;
 const SCAN_RADIUS_MILES = 150;
+const DEEP_REFRESH_PAGES = 3;
 const LAST_SCAN_TIMESTAMP_KEY = "worker:last_scan_time";
-const DEEP_REFRESH_PAGES = 3; // How many pages to scan for each hub to refresh timestamps
 
 const CITY_HUBS = [
   "Seattle, WA",
@@ -121,12 +117,10 @@ const getCityCoordinates = async (city) => {
 const pruneStaleAnimals = async () => {
   console.log("DEEP REFRESH: Pruning stale records...");
   const cutoffDate = new Date(Date.now() - 25 * 60 * 60 * 1000);
-
   const { count } = await prisma.animalWithVideo.deleteMany({
     where: { lastSeenAt: { lt: cutoffDate } },
   });
   console.log(`DEEP REFRESH: Pruned ${count} stale animal records.`);
-
   const orgPruneResult = await prisma.organization.deleteMany({
     where: { animals: { none: {} } },
   });
@@ -146,21 +140,23 @@ const runDeepRefresh = async () => {
 
   await pruneStaleAnimals();
 
+  // --- PHASE 1: BROAD REFRESH ---
+  console.log(
+    "DEEP REFRESH: Starting Phase 1: Broad refresh of recent animals..."
+  );
   for (const city of CITY_HUBS) {
     try {
       const coords = await getCityCoordinates(city);
       const locationString = `${coords.lat},${coords.lng}`;
       const token = await getValidToken();
-
       let totalRefreshedInHub = 0;
 
-      // Scan the first few pages to "touch" recently active animals
       for (let page = 1; page <= DEEP_REFRESH_PAGES; page++) {
         const response = await axios.get(PETFINDER_API_URL, {
           headers: { Authorization: `Bearer ${token}` },
           params: {
             limit: PAGE_LIMIT,
-            page: page,
+            page,
             location: locationString,
             distance: SCAN_RADIUS_MILES,
             sort: "recent",
@@ -168,13 +164,9 @@ const runDeepRefresh = async () => {
         });
 
         const { animals } = response.data;
-        if (!animals || animals.length === 0) {
-          break; // No more animals on this page, stop scanning this hub
-        }
+        if (!animals || animals.length === 0) break;
 
         const animalIds = animals.map((a) => a.id);
-
-        // "Touch" the records to update their `lastSeenAt` timestamp
         const { count } = await prisma.animalWithVideo.updateMany({
           where: { id: { in: animalIds } },
           data: { lastSeenAt: new Date() },
@@ -182,29 +174,84 @@ const runDeepRefresh = async () => {
         totalRefreshedInHub += count;
       }
       console.log(
-        `DEEP REFRESH: Refreshed ${totalRefreshedInHub} records for hub: ${city}`
+        `DEEP REFRESH: Broad refresh for ${city} touched ${totalRefreshedInHub} records.`
       );
-
-      // --- END OF FIX ---
     } catch (error) {
       console.error(
-        `DEEP REFRESH: Failed to refresh hub ${city}:`,
+        `DEEP REFRESH: Failed to broad-refresh hub ${city}:`,
         error.message
       );
     }
   }
+
+  // --- PHASE 2: TARGETED RE-VALIDATION (SAFETY NET) ---
+  console.log(
+    "DEEP REFRESH: Starting Phase 2: Targeted re-validation of at-risk animals..."
+  );
+  try {
+    const twentyFiveHoursAgo = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    const twentyThreeHoursAgo = new Date(Date.now() - 23 * 60 * 60 * 1000);
+
+    const atRiskAnimals = await prisma.animalWithVideo.findMany({
+      where: {
+        lastSeenAt: { lt: twentyThreeHoursAgo, gte: twentyFiveHoursAgo },
+      },
+      select: { id: true },
+    });
+
+    if (atRiskAnimals.length > 0) {
+      console.log(
+        `DEEP REFRESH: Found ${atRiskAnimals.length} at-risk animals to re-validate.`
+      );
+      let totalRefreshed = 0;
+      const token = await getValidToken();
+
+      for (const animal of atRiskAnimals) {
+        try {
+          await axios.get(`${PETFINDER_API_URL}/${animal.id}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          await prisma.animalWithVideo.update({
+            where: { id: animal.id },
+            data: { lastSeenAt: new Date() },
+          });
+          totalRefreshed++;
+        } catch (error) {
+          if (error.response && error.response.status === 404) {
+            console.log(
+              `DEEP REFRESH: At-risk animal ID ${animal.id} is no longer active.`
+            );
+          } else {
+            console.error(
+              `DEEP REFRESH: Error re-validating at-risk animal ID ${animal.id}:`,
+              error.message
+            );
+          }
+        }
+      }
+      console.log(
+        `DEEP REFRESH: Targeted re-validation refreshed ${totalRefreshed} records.`
+      );
+    } else {
+      console.log("DEEP REFRESH: No at-risk animals found to re-validate.");
+    }
+  } catch (error) {
+    console.error(
+      `DEEP REFRESH: An error occurred during targeted re-validation:`,
+      error.message
+    );
+  }
+
   const newTimestamp = startTime.toISOString();
   await redis.set(LAST_SCAN_TIMESTAMP_KEY, newTimestamp);
   console.log(
-    `DEEP REFRESH: Daily refresh complete. Initial timestamp set to: ${newTimestamp}`
+    `DEEP REFRESH: Daily refresh complete. Timestamp set to: ${newTimestamp}`
   );
-  console.log("DEEP REFRESH: Daily refresh complete.");
 };
 
-// --- SCHEDULER ---
+// --- SCHEDULER & EXECUTION ---
 console.log("Deep Refresh Worker started. Waiting for schedule.");
 
-// Schedule the worker to run once a day at 3:00 AM (server time)
 cron.schedule(
   "0 3 * * *",
   () => {
@@ -222,9 +269,6 @@ cron.schedule(
 );
 
 // --- MANUAL EXECUTION ---
-// To run this script on-demand, comment out the cron.schedule block above
-// and uncomment the block below.
-
 // runDeepRefresh()
 //   .then(async () => {
 //     console.log("DEEP REFRESH: Manual scan complete. Disconnecting.");

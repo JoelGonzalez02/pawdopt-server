@@ -1,11 +1,13 @@
 /**
- * Pawadopt Quick Scan Worker
+ * Pawadopt Population Worker
  * --------------------------
- * This script is a long-running service that runs frequently to find brand-new
- * animals with videos and add them and their organization data to the database.
+ * This is a one-time script to perform the initial, large-scale population
+ * of an empty database. It finds a large number of animals with videos,
+ * fetches their details, and sets the initial timestamp for the
+ * automated quick-scan worker to take over.
  *
  * How to run:
- * In production: pm2 start quick-scan-worker.js --name="quick-scan"
+ * node populate-worker.js
  */
 
 // --- IMPORTS ---
@@ -15,22 +17,16 @@ import axios from "axios";
 import dotenv from "dotenv";
 import querystring from "querystring";
 import opencage from "opencage-api-client";
-import cron from "node-cron";
 
 // --- CONFIGURATION ---
 dotenv.config();
 const PETFINDER_API_URL = "https://api.petfinder.com/v2/animals";
 const PAGE_LIMIT = 100;
 const SCAN_RADIUS_MILES = 150;
-const TARGET_PER_HUB = 40;
+const TARGET_PER_HUB = 100; // High target for a deep, initial scan
 const LAST_SCAN_TIMESTAMP_KEY = "worker:last_scan_time";
-const PETFINDER_TOKEN_KEY = "petfinder_token";
 
 const CITY_HUBS = [
-  "Seattle, WA",
-  "Portland, OR",
-  "Sacramento, CA",
-  "San Francisco, CA",
   "Los Angeles, CA",
   "San Diego, CA",
   "Las Vegas, NV",
@@ -64,15 +60,16 @@ const CITY_COORDS_CACHE_KEY = "worker:coords";
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
 const redis = new Redis(process.env.REDIS_URL);
-redis.on("error", (err) => console.error("QUICK SCAN: Redis Error", err));
-redis.on("connect", () => console.log("QUICK SCAN: Connected to Redis."));
+redis.on("error", (err) => console.error("POPULATE WORKER: Redis Error", err));
+redis.on("connect", () => console.log("POPULATE WORKER: Connected to Redis."));
 
-// --- CENTRALIZED TOKEN MANAGEMENT IN REDIS ---
+// --- PETFINDER TOKEN MANAGEMENT ---
+let petfinderToken = { token: null, expiresAt: 0 };
+
 const getValidToken = async () => {
-  let token = await redis.get(PETFINDER_TOKEN_KEY);
-  if (token) return token;
-
-  console.log("QUICK SCAN: No valid token in Redis, fetching new one...");
+  if (petfinderToken.token && Date.now() < petfinderToken.expiresAt) {
+    return petfinderToken.token;
+  }
   try {
     const response = await axios.post(
       "https://api.petfinder.com/v2/oauth2/token",
@@ -83,12 +80,14 @@ const getValidToken = async () => {
       })
     );
     const { access_token, expires_in } = response.data;
-    await redis.set(PETFINDER_TOKEN_KEY, access_token, "EX", expires_in - 60);
-    console.log("QUICK SCAN: Successfully fetched and cached new token.");
-    return access_token;
+    petfinderToken = {
+      token: access_token,
+      expiresAt: Date.now() + (expires_in - 60) * 1000,
+    };
+    return petfinderToken.token;
   } catch (error) {
     console.error(
-      "QUICK SCAN: Could not fetch Petfinder token.",
+      "POPULATE WORKER: Could not fetch Petfinder token.",
       error.response?.data || error.message
     );
     throw new Error("Could not authenticate with Petfinder.");
@@ -118,7 +117,7 @@ const getPlayableVideoUrl = (animal) => {
 const getCityCoordinates = async (city) => {
   const cachedCoords = await redis.hget(CITY_COORDS_CACHE_KEY, city);
   if (cachedCoords) return JSON.parse(cachedCoords);
-  console.log(`QUICK SCAN: Geocoding ${city}...`);
+  console.log(`POPULATE WORKER: Geocoding ${city}...`);
   const data = await opencage.geocode({
     q: city,
     key: process.env.OPENCAGE_API_KEY,
@@ -132,44 +131,33 @@ const getCityCoordinates = async (city) => {
 };
 
 // --- MAIN WORKER ---
-const runQuickScan = async () => {
+const runPopulationScan = async () => {
   const startTime = new Date();
   console.log(
-    `QUICK SCAN: [${startTime.toLocaleString()}] Starting scan for new animals...`
+    `POPULATE WORKER: [${startTime.toLocaleString()}] Starting database population scan...`
   );
-
-  const lastScanTime = await redis.get(LAST_SCAN_TIMESTAMP_KEY);
-  if (!lastScanTime) {
-    console.log(
-      "QUICK SCAN: No last scan time found. Run deep-refresh-worker first."
-    );
-    return;
-  }
-  console.log(`QUICK SCAN: Scanning for animals added after: ${lastScanTime}`);
-
-  let consecutiveFailures = 0;
 
   for (const city of CITY_HUBS) {
     let newAnimalsFoundInHub = 0;
     try {
       const coords = await getCityCoordinates(city);
       const locationString = `${coords.lat},${coords.lng}`;
+      console.log(`POPULATE WORKER: Scanning hub: ${city}`);
+
       let currentPage = 1;
       let hasMorePages = true;
 
       while (hasMorePages && newAnimalsFoundInHub < TARGET_PER_HUB) {
         const token = await getValidToken();
-        const params = {
-          limit: PAGE_LIMIT,
-          page: currentPage,
-          location: locationString,
-          distance: SCAN_RADIUS_MILES,
-          sort: "recent",
-          after: lastScanTime,
-        };
         const response = await axios.get(PETFINDER_API_URL, {
           headers: { Authorization: `Bearer ${token}` },
-          params,
+          params: {
+            limit: PAGE_LIMIT,
+            page: currentPage,
+            location: locationString,
+            distance: SCAN_RADIUS_MILES,
+            sort: "recent",
+          },
         });
 
         const { animals, pagination } = response.data;
@@ -211,7 +199,7 @@ const runQuickScan = async () => {
             });
           } catch (orgError) {
             console.error(
-              `QUICK SCAN: Failed to fetch/save organization ${animal.organization_id}`,
+              `POPULATE WORKER: Failed to fetch/save organization ${animal.organization_id}`,
               orgError.message
             );
             continue;
@@ -236,7 +224,7 @@ const runQuickScan = async () => {
             }
           } catch (geoError) {
             console.error(
-              `QUICK SCAN: Could not geocode address for animal ${animal.id}: ${geoError.message}`
+              `POPULATE WORKER: Could not geocode address for animal ${animal.id}: ${geoError.message}`
             );
           }
 
@@ -290,62 +278,40 @@ const runQuickScan = async () => {
           newAnimalsFoundInHub++;
         }
 
+        console.log(
+          `POPULATE WORKER: [${city}] Progress: ${newAnimalsFoundInHub}/${TARGET_PER_HUB} animals found.`
+        );
         if (pagination && currentPage < pagination.total_pages) {
           currentPage++;
         } else {
           hasMorePages = false;
         }
       }
-      if (newAnimalsFoundInHub > 0) {
-        console.log(
-          `QUICK SCAN: [${city}] Found and saved ${newAnimalsFoundInHub} new animals.`
-        );
-      }
-      consecutiveFailures = 0; // Reset counter on success
     } catch (error) {
       console.error(
-        `QUICK SCAN: Failed to process hub ${city}:`,
+        `POPULATE WORKER: Failed to process hub ${city}:`,
         error.response?.data || error.message
       );
-      consecutiveFailures++;
-      if (consecutiveFailures >= 5) {
-        throw new Error(
-          "Aborting scan due to 5 consecutive hub failures. Check API status."
-        );
-      }
     }
   }
 
-  await redis.set(LAST_SCAN_TIMESTAMP_KEY, startTime.toISOString());
-  console.log(`QUICK SCAN: Scan for new animals complete.`);
+  const newTimestamp = startTime.toISOString();
+  await redis.set(LAST_SCAN_TIMESTAMP_KEY, newTimestamp);
+  console.log(
+    `POPULATE WORKER: Population scan complete. Initial timestamp set to: ${newTimestamp}`
+  );
 };
 
-// --- SCHEDULER ---
-console.log("Quick Scan Worker started. Waiting for schedule.");
-cron.schedule("0 */2 * * *", () => {
-  // Every 2 hours
-  console.log(`--- [${new Date().toLocaleString()}] Running Quick Scan ---`);
-  runQuickScan().catch((e) =>
-    console.error(
-      "QUICK SCAN: A fatal error occurred during the scheduled run:",
-      e.message
-    )
-  );
-});
-
-// --- MANUAL EXECUTION ---
-// To run this script on-demand, comment out the cron.schedule block above
-// and uncomment the block below.
-
-// runQuickScan()
-//   .then(async () => {
-//     console.log("Quick Scan: Manual scan complete. Disconnecting.");
-//     await prisma.$disconnect();
-//     await redis.quit();
-//   })
-//   .catch(async (e) => {
-//     console.error("Quick Scan: A fatal error occurred:", e);
-//     await prisma.$disconnect();
-//     await redis.quit();
-//     process.exit(1);
-//   });
+// --- EXECUTION ---
+runPopulationScan()
+  .then(async () => {
+    console.log("POPULATE WORKER: Disconnecting.");
+    await prisma.$disconnect();
+    await redis.quit();
+  })
+  .catch(async (e) => {
+    console.error("POPULATE WORKER: A fatal error occurred:", e);
+    await prisma.$disconnect();
+    await redis.quit();
+    process.exit(1);
+  });
