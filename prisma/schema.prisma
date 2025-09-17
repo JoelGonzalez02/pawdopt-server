@@ -9,27 +9,25 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Model for the data from your scanner
 model AnimalWithVideo {
-  id     Int    @id
-  // --- ADD THESE FIELDS BACK ---
-  name   String
-  url    String
-  type   String // This was the old name, let's keep it consistent
-  age    String
-  gender String
-  size   String
-  status String
-  likeCount   Int      @default(0)
-
+  id        Int      @id
+  name      String
+  url       String
+  type      String
+  age       String
+  gender    String
+  size      String
+  status    String
+  likeCount Int      @default(0)
+  
   // Store complex objects as JSON
-  breeds  Json
-  colors  Json
-  photos  Json
-  videos  Json
-  contact Json
-  attributes  Json @default("{}")
-  environment Json @default("{}")
+  breeds      Json
+  colors      Json
+  photos      Json
+  videos      Json
+  contact     Json
+  attributes  Json     @default("{}")
+  environment Json     @default("{}")
 
   // Location and Timestamps
   city       String
@@ -39,10 +37,30 @@ model AnimalWithVideo {
   createdAt  DateTime @default(now())
   lastSeenAt DateTime @updatedAt
 
-  @@index([city, state, type]) // Use 'type' to match the field name
+  // --- NEW RELATIONSHIP FIELDS ---
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  @@index([city, state, type])
 }
 
-// Model for an anonymous user
+// --- NEW MODEL FOR ORGANIZATIONS ---
+model Organization {
+  id      String   @id // The ID from Petfinder (e.g., "CA123")
+  name    String
+  email   String?
+  phone   String?
+  address Json?    // Store the address object as JSON
+  url     String
+  
+  // This creates the other side of the relationship to AnimalWithVideo
+  animals AnimalWithVideo[]
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// --- Your existing User and SeenVideo models ---
 model User {
   id         Int         @id @default(autoincrement())
   uuid       String      @unique
@@ -52,12 +70,11 @@ model User {
   @@map("users")
 }
 
-// Model to track which videos a user has seen
 model SeenVideo {
-  userId    Int      @map("user_id")
-  animalId  Int      @map("animal_id")
-  seenAt    DateTime @default(now()) @map("seen_at")
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId   Int      @map("user_id")
+  animalId Int      @map("animal_id")
+  seenAt   DateTime @default(now()) @map("seen_at")
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@id([userId, animalId])
   @@map("seen_videos")
