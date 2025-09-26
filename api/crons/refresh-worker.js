@@ -19,7 +19,11 @@ const API_DELAY_MS = 2000; // Delay between batches
 
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL, {
+  tls: {
+    rejectUnauthorized: false, // Required for Vercel's networking environment
+  },
+});
 
 axiosRetry(axios, {
   retries: 3,

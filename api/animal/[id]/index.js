@@ -6,7 +6,11 @@ import pino from "pino";
 
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL, {
+  tls: {
+    rejectUnauthorized: false, // Required for Vercel's networking environment
+  },
+});
 const logger = pino({
   transport:
     process.env.NODE_ENV !== "production"

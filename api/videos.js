@@ -8,7 +8,11 @@ import pino from "pino";
 
 // --- INITIALIZATION (Moved from index.js) ---
 const prisma = new PrismaClient();
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL, {
+  tls: {
+    rejectUnauthorized: false, // Required for Vercel's networking environment
+  },
+});
 const logger = pino({
   transport:
     process.env.NODE_ENV !== "production"
@@ -80,12 +84,10 @@ export default async function handler(req, res) {
       const pageIds = animalIds.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
       if (pageIds.length === 0) {
-        return res
-          .status(200)
-          .json({
-            animals: [],
-            pagination: { currentPage: page, totalPages, sessionId },
-          });
+        return res.status(200).json({
+          animals: [],
+          pagination: { currentPage: page, totalPages, sessionId },
+        });
       }
 
       const animalsData = await prisma.animalWithVideo.findMany({
@@ -96,12 +98,10 @@ export default async function handler(req, res) {
       const orderedAnimals = pageIds
         .map((id) => animalsData.find((a) => a.id === id))
         .filter(Boolean);
-      return res
-        .status(200)
-        .json({
-          animals: orderedAnimals,
-          pagination: { currentPage: page, totalPages, sessionId },
-        });
+      return res.status(200).json({
+        animals: orderedAnimals,
+        pagination: { currentPage: page, totalPages, sessionId },
+      });
     }
 
     // Logic for creating a new session
@@ -170,12 +170,10 @@ export default async function handler(req, res) {
     const pageIds = finalPlaylist.slice(0, PAGE_SIZE);
 
     if (pageIds.length === 0) {
-      return res
-        .status(200)
-        .json({
-          animals: [],
-          pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
-        });
+      return res.status(200).json({
+        animals: [],
+        pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
+      });
     }
 
     const pageData = await prisma.animalWithVideo.findMany({
@@ -187,12 +185,10 @@ export default async function handler(req, res) {
       .map((id) => pageData.find((a) => a.id === id))
       .filter(Boolean);
 
-    res
-      .status(200)
-      .json({
-        animals: orderedAnimals,
-        pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
-      });
+    res.status(200).json({
+      animals: orderedAnimals,
+      pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
+    });
   } catch (error) {
     logger.error({ err: error, body: req.body }, "Error in /api/videos");
     res.status(500).json({ message: "Failed to fetch video feed." });

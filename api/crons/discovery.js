@@ -52,7 +52,11 @@ const CITY_HUBS = [
 
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL, {
+  tls: {
+    rejectUnauthorized: false, // Required for Vercel's networking environment
+  },
+});
 // Note: Vercel's serverless environment handles connections differently,
 // so we don't need the connect/error listeners here.
 
