@@ -1,0 +1,16 @@
+{
+  "crons": [
+    {
+      "path": "/api/crons/refresh",
+      "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/crons/quick-scan",
+      "schedule": "0 */4 * * *"
+    },
+    {
+      "path": "/api/crons/discovery",
+      "schedule": "30 2 * * *"
+    }
+  ]
+}
