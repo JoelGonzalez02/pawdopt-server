@@ -109,10 +109,10 @@ console.log("Cleanup Worker started. Waiting for schedule.");
 
 // Schedule the worker to run once a day at 4:00 AM (server time)
 cron.schedule(
-  "0 4 * * *",
+  "0 * * * *",
   () => {
     console.log(
-      `--- [${new Date().toLocaleString()}] Running Daily Cleanup Task ---`
+      `--- [${new Date().toLocaleString()}] Running Hourly Cleanup Task ---`
     );
     runCleanup().catch((e) => {
       console.error(
