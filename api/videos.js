@@ -6,11 +6,12 @@ import { randomUUID } from "crypto";
 import opencage from "opencage-api-client";
 import pino from "pino";
 
-// --- INITIALIZATION (Moved from index.js) ---
+// --- INITIALIZATION ---
 const prisma = new PrismaClient();
 const redis = new Redis(process.env.REDIS_URL, {
+  // Add explicit TLS for Vercel compatibility
   tls: {
-    rejectUnauthorized: false, // Required for Vercel's networking environment
+    rejectUnauthorized: false,
   },
 });
 const logger = pino({
@@ -22,7 +23,7 @@ const logger = pino({
 
 redis.on("error", (err) => logger.error({ err }, "Redis Client Error"));
 
-// --- HELPER FUNCTIONS (Copied from index.js) ---
+// --- HELPER FUNCTIONS ---
 const getUserCoordinates = async (location) => {
   const sanitizedLocation = location.toLowerCase().replace(/[^a-z0-9]/g, "");
   const cacheKey = `coords:${sanitizedLocation}`;
@@ -54,7 +55,6 @@ const getUserCoordinates = async (location) => {
 
 // --- VERCEL SERVERLESS FUNCTION HANDLER ---
 export default async function handler(req, res) {
-  // Ensure we only handle POST requests
   if (req.method !== "POST") {
     return res.status(405).json({ message: "Method Not Allowed" });
   }
@@ -69,7 +69,6 @@ export default async function handler(req, res) {
   }
 
   try {
-    // --- THIS IS THE EXACT SAME LOGIC FROM YOUR EXPRESS ROUTE ---
     if (sessionId) {
       // Logic for paginating an existing session
       const sessionKey = `session:${sessionId}`;
@@ -104,35 +103,43 @@ export default async function handler(req, res) {
       });
     }
 
-    // Logic for creating a new session
-    logger.info({ location }, "Creating new video session");
+    // --- THREE-TIERED PLAYLIST GENERATION LOGIC ---
+    logger.info({ location }, "Creating new tiered video session");
     const coords = await getUserCoordinates(location);
     const userLat = coords.lat;
     const userLon = coords.lon;
-    const searchRadiusMiles = 150;
 
-    const localCandidates = await prisma.$queryRaw`
+    const hyperLocalRadiusKm = 30 * 1.60934;
+    const regionalRadiusKm = 100 * 1.60934;
+
+    const hyperLocalAnimals = await prisma.$queryRaw`
         SELECT id FROM "AnimalWithVideo"
-        WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND
-        (6371 * acos(LEAST(1.0, GREATEST(-1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude)))))) < ${
-      searchRadiusMiles * 1.60934
-    }
-        LIMIT 500;
+        WHERE (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) < ${hyperLocalRadiusKm}
+        ORDER BY distance ASC
+        LIMIT 50;
     `;
-    const localIds = localCandidates.map((c) => c.id);
+    const hyperLocalIds = hyperLocalAnimals.map((c) => c.id);
 
-    const nationwideCandidates = await prisma.animalWithVideo.findMany({
+    const regionalAnimals = await prisma.$queryRaw`
+        SELECT id FROM "AnimalWithVideo"
+        WHERE (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) < ${regionalRadiusKm}
+        AND id NOT IN (${
+          hyperLocalIds.length > 0 ? Prisma.join(hyperLocalIds) : "NULL"
+        })
+        ORDER BY RANDOM()
+        LIMIT 150;
+    `;
+    const regionalIds = regionalAnimals.map((c) => c.id);
+
+    const allLocalIds = [...hyperLocalIds, ...regionalIds];
+    const nationwideAnimals = await prisma.animalWithVideo.findMany({
+      where: {
+        id: { notIn: allLocalIds.length > 0 ? allLocalIds : undefined },
+      },
       take: 200,
       select: { id: true },
-      where: { id: { notIn: localIds } },
     });
-    const nationwideIds = nationwideCandidates.map((c) => c.id);
-
-    // Shuffle both lists
-    for (let i = localIds.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [localIds[i], localIds[j]] = [localIds[j], localIds[i]];
-    }
+    let nationwideIds = nationwideAnimals.map((c) => c.id);
     for (let i = nationwideIds.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [nationwideIds[i], nationwideIds[j]] = [
@@ -141,22 +148,9 @@ export default async function handler(req, res) {
       ];
     }
 
-    // Interleave the lists
-    const finalPlaylist = [];
-    let localIndex = 0;
-    let nationwideIndex = 0;
-    const localRatio = 3;
-    while (
-      localIndex < localIds.length ||
-      nationwideIndex < nationwideIds.length
-    ) {
-      for (let i = 0; i < localRatio && localIndex < localIds.length; i++) {
-        finalPlaylist.push(localIds[localIndex++]);
-      }
-      if (nationwideIndex < nationwideIds.length) {
-        finalPlaylist.push(nationwideIds[nationwideIndex++]);
-      }
-    }
+    const finalPlaylist = [...hyperLocalIds, ...regionalIds, ...nationwideIds];
+
+    // --- END OF PLAYLIST LOGIC ---
 
     const newSessionId = randomUUID();
     await redis.set(

@@ -13,15 +13,15 @@ const PETFINDER_API_URL = "https://api.petfinder.com/v2/animals";
 const PETFINDER_TOKEN_KEY = "petfinder_token";
 
 const REFRESH_THRESHOLD_HOURS = 23;
-const BATCH_LIMIT = 20;
-const HOURLY_API_BUDGET = 100; // Increased budget for robustness
-const API_DELAY_MS = 2000; // Delay between batches
+const BATCH_LIMIT = 25;
+const API_DELAY_MS = 2000;
 
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
 const redis = new Redis(process.env.REDIS_URL, {
+  // Add explicit TLS for Vercel compatibility
   tls: {
-    rejectUnauthorized: false, // Required for Vercel's networking environment
+    rejectUnauthorized: false,
   },
 });
 
@@ -98,7 +98,7 @@ async function runHourlyRefresh() {
   let totalProcessed = 0;
   let hasMoreAnimals = true;
 
-  while (hasMoreAnimals && totalProcessed < HOURLY_API_BUDGET) {
+  while (hasMoreAnimals) {
     const cutoffDate = new Date();
     cutoffDate.setHours(cutoffDate.getHours() - REFRESH_THRESHOLD_HOURS);
 
@@ -129,8 +129,8 @@ async function runHourlyRefresh() {
         })
       )
     );
-
     const results = await Promise.allSettled(apiCallPromises);
+
     const updatePromises = [];
     const deletePromises = [];
 
@@ -138,7 +138,6 @@ async function runHourlyRefresh() {
       const originalAnimal = animalsToAudit[index];
       if (result.status === "fulfilled") {
         const animalData = result.value.data.animal;
-        // FIX: Explicitly map all fields to match your schema perfectly.
         updatePromises.push(
           prisma.animalWithVideo.update({
             where: { id: originalAnimal.id },
@@ -183,12 +182,6 @@ async function runHourlyRefresh() {
     }
 
     totalProcessed += animalsToAudit.length;
-    if (totalProcessed >= HOURLY_API_BUDGET) {
-      console.log(
-        "HOURLY REFRESH: Hourly API budget reached. Will continue on next run."
-      );
-      break;
-    }
 
     if (hasMoreAnimals) {
       await delay(API_DELAY_MS);
