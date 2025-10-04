@@ -5,7 +5,7 @@ import Redis from "ioredis";
 import axios from "axios";
 import querystring from "querystring";
 import pino from "pino";
-import { NextRequest, NextResponse } from "next/server"; // Import NextRequest
+import { URL } from "url"; // Use the built-in Node.js URL module
 
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
@@ -54,18 +54,23 @@ const getPetfinderToken = async () => {
 };
 
 // --- VERCEL SERVERLESS FUNCTION HANDLER ---
-export async function GET(req) {
-  // FIX: Use URLSearchParams to get query parameters
-  const queryParams = Object.fromEntries(req.nextUrl.searchParams.entries());
+export default async function handler(req, res) {
+  if (req.method !== "GET") {
+    return res.status(405).json({ message: "Method Not Allowed" });
+  }
+
+  // FIX: Parse query parameters using the standard URL module
+  const fullUrl = new URL(req.url, `https://${req.headers.host}`);
+  const queryParams = Object.fromEntries(fullUrl.searchParams.entries());
   const cacheKey = `animals:enriched:${querystring.stringify(queryParams)}`;
 
   try {
     const cachedData = await redis.get(cacheKey);
     if (cachedData) {
-      return NextResponse.json(JSON.parse(cachedData), {
-        headers: { "X-Cache": "HIT" },
-      });
+      res.setHeader("X-Cache", "HIT");
+      return res.status(200).json(JSON.parse(cachedData));
     }
+    res.setHeader("X-Cache", "MISS");
 
     const petfinderToken = await getPetfinderToken();
 
@@ -73,15 +78,15 @@ export async function GET(req) {
       "https://api.petfinder.com/v2/animals",
       {
         headers: { Authorization: `Bearer ${petfinderToken}` },
-        params: queryParams, // Use the parsed query params
+        params: queryParams,
       }
     );
     const data = petfinderResponse.data;
     if (!data.animals || data.animals.length === 0) {
-      return NextResponse.json(data);
+      return res.status(200).json(data);
     }
 
-    // --- DATA ENRICHMENT LOGIC (Unchanged) ---
+    // --- DATA ENRICHMENT LOGIC ---
     const orgIds = [...new Set(data.animals.map((a) => a.organization_id))];
     const existingOrgs = await prisma.organization.findMany({
       where: { id: { in: orgIds } },
@@ -125,14 +130,14 @@ export async function GET(req) {
     // --- END ENRICHMENT LOGIC ---
 
     await redis.set(cacheKey, JSON.stringify(data), "EX", 3600);
-    return NextResponse.json(data, { headers: { "X-Cache": "MISS" } });
+    res.status(200).json(data);
   } catch (error) {
     logger.error(
       { err: error.response?.data || error.message, query: queryParams },
       "Error in /api/animals"
     );
-    return new NextResponse("An error occurred while fetching animals.", {
-      status: 500,
-    });
+    res
+      .status(500)
+      .json({ message: "An error occurred while fetching animals." });
   }
 }
