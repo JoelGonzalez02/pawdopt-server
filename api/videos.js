@@ -9,7 +9,6 @@ import pino from "pino";
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
 const redis = new Redis(process.env.REDIS_URL, {
-  // Add explicit TLS for Vercel compatibility
   tls: {
     rejectUnauthorized: false,
   },
