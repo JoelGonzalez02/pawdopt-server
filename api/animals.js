@@ -5,7 +5,7 @@ import Redis from "ioredis";
 import axios from "axios";
 import querystring from "querystring";
 import pino from "pino";
-import { URL } from "url"; // Use the built-in Node.js URL module
+import { URL } from "url";
 
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
@@ -59,9 +59,16 @@ export default async function handler(req, res) {
     return res.status(405).json({ message: "Method Not Allowed" });
   }
 
-  // FIX: Parse query parameters using the standard URL module
   const fullUrl = new URL(req.url, `https://${req.headers.host}`);
   const queryParams = Object.fromEntries(fullUrl.searchParams.entries());
+
+  // --- FIX: Trim whitespace from all incoming query parameters ---
+  for (const key in queryParams) {
+    if (typeof queryParams[key] === "string") {
+      queryParams[key] = queryParams[key].trim();
+    }
+  }
+
   const cacheKey = `animals:enriched:${querystring.stringify(queryParams)}`;
 
   try {
