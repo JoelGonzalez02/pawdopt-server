@@ -55,6 +55,7 @@ const getPetfinderToken = async () => {
 
 // --- VERCEL SERVERLESS FUNCTION HANDLER ---
 export default async function handler(req, res) {
+  console.log(`Received a request to /api/videos with method: ${req.method}`);
   if (req.method !== "GET") {
     return res.status(405).json({ message: "Method Not Allowed" });
   }
