@@ -58,7 +58,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ message: "Method Not Allowed" });
   }
 
-  const { location, page = 1, sessionId } = req.body;
+  const { location, page = 1, sessionId, userId } = req.body;
   const PAGE_SIZE = 10;
 
   if (!location && !sessionId) {
@@ -69,7 +69,6 @@ export default async function handler(req, res) {
 
   try {
     if (sessionId) {
-      // Logic for paginating an existing session
       const sessionKey = `session:${sessionId}`;
       const animalIdsJson = await redis.get(sessionKey);
       if (!animalIdsJson) {
@@ -102,39 +101,70 @@ export default async function handler(req, res) {
       });
     }
 
-    // --- THREE-TIERED PLAYLIST GENERATION LOGIC ---
-    logger.info({ location }, "Creating new tiered video session");
+    logger.info({ location, userId }, "Creating new tiered video session");
     const coords = await getUserCoordinates(location);
+
+    if (!coords) {
+      return res
+        .status(200)
+        .json({
+          animals: [],
+          pagination: {
+            currentPage: 1,
+            totalPages: 0,
+            sessionId: randomUUID(),
+          },
+        });
+    }
+
     const userLat = coords.lat;
     const userLon = coords.lon;
+
+    let user = await prisma.user.findUnique({ where: { uuid: userId } });
+    if (!user) {
+      user = await prisma.user.create({ data: { uuid: userId } });
+    }
+
+    const seenVideos = await prisma.seenVideo.findMany({
+      where: { userId: user.id },
+      select: { animalId: true },
+    });
+    const seenVideoIds = seenVideos.map((v) => v.animalId);
 
     const hyperLocalRadiusKm = 30 * 1.60934;
     const regionalRadiusKm = 100 * 1.60934;
 
-    // Step 1: Fetch the 50 absolute closest "hyper-local" animals.
     const hyperLocalAnimals = await prisma.$queryRaw`
         SELECT id FROM "AnimalWithVideo"
         WHERE (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) < ${hyperLocalRadiusKm}
+        ${
+          seenVideoIds.length > 0
+            ? Prisma.sql`AND id NOT IN (${Prisma.join(seenVideoIds)})`
+            : Prisma.empty
+        }
         ORDER BY (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) ASC
         LIMIT 50;
     `;
     const hyperLocalIds = hyperLocalAnimals.map((c) => c.id);
 
-    // Step 2: Fetch a random group of "regional" animals.
+    const seenAndHyperLocalIds = [...seenVideoIds, ...hyperLocalIds];
     const regionalAnimals = await prisma.$queryRaw`
         SELECT id FROM "AnimalWithVideo"
         WHERE (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) < ${regionalRadiusKm}
-        AND id NOT IN (${Prisma.join(hyperLocalIds)})
+        ${
+          seenAndHyperLocalIds.length > 0
+            ? Prisma.sql`AND id NOT IN (${Prisma.join(seenAndHyperLocalIds)})`
+            : Prisma.empty
+        }
         ORDER BY RANDOM()
         LIMIT 150;
     `;
     const regionalIds = regionalAnimals.map((c) => c.id);
 
-    // Step 3: Fetch a random set of nationwide animals.
-    const allLocalIds = [...hyperLocalIds, ...regionalIds];
+    const allFoundIds = [...seenAndHyperLocalIds, ...regionalIds];
     const nationwideAnimals = await prisma.animalWithVideo.findMany({
       where: {
-        id: { notIn: allLocalIds.length > 0 ? allLocalIds : undefined },
+        id: { notIn: allFoundIds.length > 0 ? allFoundIds : undefined },
       },
       take: 200,
       select: { id: true },
@@ -150,8 +180,6 @@ export default async function handler(req, res) {
 
     const finalPlaylist = [...hyperLocalIds, ...regionalIds, ...nationwideIds];
 
-    // --- END OF PLAYLIST LOGIC ---
-
     const newSessionId = randomUUID();
     await redis.set(
       `session:${newSessionId}`,
@@ -159,26 +187,21 @@ export default async function handler(req, res) {
       "EX",
       7200
     );
-
     const totalPages = Math.ceil(finalPlaylist.length / PAGE_SIZE);
     const pageIds = finalPlaylist.slice(0, PAGE_SIZE);
-
     if (pageIds.length === 0) {
       return res.status(200).json({
         animals: [],
         pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
       });
     }
-
     const pageData = await prisma.animalWithVideo.findMany({
       where: { id: { in: pageIds } },
       include: { organization: true },
     });
-
     const orderedAnimals = pageIds
       .map((id) => pageData.find((a) => a.id === id))
       .filter(Boolean);
-
     res.status(200).json({
       animals: orderedAnimals,
       pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
