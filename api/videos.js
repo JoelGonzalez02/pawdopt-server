@@ -1,10 +1,11 @@
-// api/videos.js
+// api/animals.js
 
-import { Prisma, PrismaClient } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 import Redis from "ioredis";
-import { randomUUID } from "crypto";
-import opencage from "opencage-api-client";
+import axios from "axios";
+import querystring from "querystring";
 import pino from "pino";
+import { URL } from "url"; // Use the built-in Node.js URL module
 
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
@@ -22,192 +23,121 @@ const logger = pino({
 
 redis.on("error", (err) => logger.error({ err }, "Redis Client Error"));
 
-// --- HELPER FUNCTIONS ---
-const getUserCoordinates = async (location) => {
-  const sanitizedLocation = location.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const cacheKey = `coords:${sanitizedLocation}`;
+// --- HELPER: TOKEN MANAGEMENT ---
+const PETFINDER_TOKEN_KEY = "petfinder_token";
 
-  const cachedCoords = await redis.get(cacheKey);
-  if (cachedCoords) {
-    logger.info({ location }, `Cache HIT for coordinates`);
-    return JSON.parse(cachedCoords);
+const getPetfinderToken = async () => {
+  let token = await redis.get(PETFINDER_TOKEN_KEY);
+  if (token) return token;
+
+  logger.info("Fetching new Petfinder token...");
+  try {
+    const response = await axios.post(
+      "https://api.petfinder.com/v2/oauth2/token",
+      querystring.stringify({
+        grant_type: "client_credentials",
+        client_id: process.env.PETFINDER_CLIENT_ID,
+        client_secret: process.env.PETFINDER_CLIENT_SECRET,
+      })
+    );
+    const { access_token, expires_in } = response.data;
+    await redis.set(PETFINDER_TOKEN_KEY, access_token, "EX", expires_in - 60);
+    logger.info("Successfully fetched and cached new token.");
+    return access_token;
+  } catch (error) {
+    logger.error(
+      { err: error.response?.data || error.message },
+      "Error fetching Petfinder token"
+    );
+    throw new Error("Could not fetch token from Petfinder");
   }
-
-  logger.info(
-    { location },
-    `Cache MISS for coordinates. Calling OpenCage API.`
-  );
-  const geoData = await opencage.geocode({
-    q: location,
-    key: process.env.OPENCAGE_API_KEY,
-  });
-  if (!geoData.results || geoData.results.length === 0) {
-    throw new Error(`Could not determine coordinates for ${location}`);
-  }
-
-  const { lat, lng } = geoData.results[0].geometry;
-  const coords = { lat, lon: lng };
-
-  await redis.set(cacheKey, JSON.stringify(coords), "EX", 60 * 60 * 24 * 30);
-  return coords;
 };
 
 // --- VERCEL SERVERLESS FUNCTION HANDLER ---
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
+  if (req.method !== "GET") {
     return res.status(405).json({ message: "Method Not Allowed" });
   }
 
-  const { location, page = 1, sessionId, userId } = req.body;
-  const PAGE_SIZE = 10;
-
-  if (!location && !sessionId) {
-    return res
-      .status(400)
-      .json({ message: "Location or sessionId is required." });
-  }
+  // FIX: Parse query parameters using the standard URL module
+  const fullUrl = new URL(req.url, `https://${req.headers.host}`);
+  const queryParams = Object.fromEntries(fullUrl.searchParams.entries());
+  const cacheKey = `animals:enriched:${querystring.stringify(queryParams)}`;
 
   try {
-    if (sessionId) {
-      const sessionKey = `session:${sessionId}`;
-      const animalIdsJson = await redis.get(sessionKey);
-      if (!animalIdsJson) {
-        return res
-          .status(404)
-          .json({ message: "Session expired. Please refresh." });
+    const cachedData = await redis.get(cacheKey);
+    if (cachedData) {
+      res.setHeader("X-Cache", "HIT");
+      return res.status(200).json(JSON.parse(cachedData));
+    }
+    res.setHeader("X-Cache", "MISS");
+
+    const petfinderToken = await getPetfinderToken();
+
+    const petfinderResponse = await axios.get(
+      "https://api.petfinder.com/v2/animals",
+      {
+        headers: { Authorization: `Bearer ${petfinderToken}` },
+        params: queryParams,
       }
-      const animalIds = JSON.parse(animalIdsJson);
-      const totalPages = Math.ceil(animalIds.length / PAGE_SIZE);
-      const pageIds = animalIds.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
-
-      if (pageIds.length === 0) {
-        return res.status(200).json({
-          animals: [],
-          pagination: { currentPage: page, totalPages, sessionId },
-        });
-      }
-
-      const animalsData = await prisma.animalWithVideo.findMany({
-        where: { id: { in: pageIds } },
-        include: { organization: true },
-      });
-
-      const orderedAnimals = pageIds
-        .map((id) => animalsData.find((a) => a.id === id))
-        .filter(Boolean);
-      return res.status(200).json({
-        animals: orderedAnimals,
-        pagination: { currentPage: page, totalPages, sessionId },
-      });
-    }
-
-    logger.info({ location, userId }, "Creating new tiered video session");
-    const coords = await getUserCoordinates(location);
-
-    if (!coords) {
-      return res
-        .status(200)
-        .json({
-          animals: [],
-          pagination: {
-            currentPage: 1,
-            totalPages: 0,
-            sessionId: randomUUID(),
-          },
-        });
-    }
-
-    const userLat = coords.lat;
-    const userLon = coords.lon;
-
-    let user = await prisma.user.findUnique({ where: { uuid: userId } });
-    if (!user) {
-      user = await prisma.user.create({ data: { uuid: userId } });
-    }
-
-    const seenVideos = await prisma.seenVideo.findMany({
-      where: { userId: user.id },
-      select: { animalId: true },
-    });
-    const seenVideoIds = seenVideos.map((v) => v.animalId);
-
-    const hyperLocalRadiusKm = 30 * 1.60934;
-    const regionalRadiusKm = 100 * 1.60934;
-
-    const hyperLocalAnimals = await prisma.$queryRaw`
-        SELECT id FROM "AnimalWithVideo"
-        WHERE (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) < ${hyperLocalRadiusKm}
-        ${
-          seenVideoIds.length > 0
-            ? Prisma.sql`AND id NOT IN (${Prisma.join(seenVideoIds)})`
-            : Prisma.empty
-        }
-        ORDER BY (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) ASC
-        LIMIT 50;
-    `;
-    const hyperLocalIds = hyperLocalAnimals.map((c) => c.id);
-
-    const seenAndHyperLocalIds = [...seenVideoIds, ...hyperLocalIds];
-    const regionalAnimals = await prisma.$queryRaw`
-        SELECT id FROM "AnimalWithVideo"
-        WHERE (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) < ${regionalRadiusKm}
-        ${
-          seenAndHyperLocalIds.length > 0
-            ? Prisma.sql`AND id NOT IN (${Prisma.join(seenAndHyperLocalIds)})`
-            : Prisma.empty
-        }
-        ORDER BY RANDOM()
-        LIMIT 150;
-    `;
-    const regionalIds = regionalAnimals.map((c) => c.id);
-
-    const allFoundIds = [...seenAndHyperLocalIds, ...regionalIds];
-    const nationwideAnimals = await prisma.animalWithVideo.findMany({
-      where: {
-        id: { notIn: allFoundIds.length > 0 ? allFoundIds : undefined },
-      },
-      take: 200,
-      select: { id: true },
-    });
-    let nationwideIds = nationwideAnimals.map((c) => c.id);
-    for (let i = nationwideIds.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [nationwideIds[i], nationwideIds[j]] = [
-        nationwideIds[j],
-        nationwideIds[i],
-      ];
-    }
-
-    const finalPlaylist = [...hyperLocalIds, ...regionalIds, ...nationwideIds];
-
-    const newSessionId = randomUUID();
-    await redis.set(
-      `session:${newSessionId}`,
-      JSON.stringify(finalPlaylist),
-      "EX",
-      7200
     );
-    const totalPages = Math.ceil(finalPlaylist.length / PAGE_SIZE);
-    const pageIds = finalPlaylist.slice(0, PAGE_SIZE);
-    if (pageIds.length === 0) {
-      return res.status(200).json({
-        animals: [],
-        pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
-      });
+    const data = petfinderResponse.data;
+    if (!data.animals || data.animals.length === 0) {
+      return res.status(200).json(data);
     }
-    const pageData = await prisma.animalWithVideo.findMany({
-      where: { id: { in: pageIds } },
-      include: { organization: true },
+
+    // --- DATA ENRICHMENT LOGIC ---
+    const orgIds = [...new Set(data.animals.map((a) => a.organization_id))];
+    const existingOrgs = await prisma.organization.findMany({
+      where: { id: { in: orgIds } },
     });
-    const orderedAnimals = pageIds
-      .map((id) => pageData.find((a) => a.id === id))
-      .filter(Boolean);
-    res.status(200).json({
-      animals: orderedAnimals,
-      pagination: { currentPage: 1, totalPages, sessionId: newSessionId },
+    const existingOrgIds = new Set(existingOrgs.map((o) => o.id));
+    const missingOrgIds = orgIds.filter((id) => !existingOrgIds.has(id));
+    const newOrgs = [];
+
+    if (missingOrgIds.length > 0) {
+      const orgPromises = missingOrgIds.map((orgId) =>
+        axios
+          .get(`https://api.petfinder.com/v2/organizations/${orgId}`, {
+            headers: { Authorization: `Bearer ${petfinderToken}` },
+          })
+          .then((response) => response.data.organization)
+          .catch(() => null)
+      );
+      const fetchedOrgs = (await Promise.all(orgPromises)).filter(Boolean);
+
+      if (fetchedOrgs.length > 0) {
+        newOrgs.push(...fetchedOrgs);
+        await prisma.organization.createMany({
+          data: fetchedOrgs.map((org) => ({
+            id: org.id,
+            name: org.name,
+            email: org.email,
+            phone: org.phone,
+            address: org.address,
+            url: org.url,
+          })),
+          skipDuplicates: true,
+        });
+      }
+    }
+
+    const allOrgs = [...existingOrgs, ...newOrgs];
+    data.animals.forEach((animal) => {
+      animal.organization =
+        allOrgs.find((org) => org.id === animal.organization_id) || null;
     });
+    // --- END ENRICHMENT LOGIC ---
+
+    await redis.set(cacheKey, JSON.stringify(data), "EX", 3600);
+    res.status(200).json(data);
   } catch (error) {
-    logger.error({ err: error, body: req.body }, "Error in /api/videos");
-    res.status(500).json({ message: "Failed to fetch video feed." });
+    logger.error(
+      { err: error.response?.data || error.message, query: queryParams },
+      "Error in /api/animals"
+    );
+    res
+      .status(500)
+      .json({ message: "An error occurred while fetching animals." });
   }
 }
