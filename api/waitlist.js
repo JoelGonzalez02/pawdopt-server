@@ -1,10 +1,14 @@
 import { PrismaClient } from "@prisma/client";
 
-// It's a best practice to instantiate Prisma Client outside the handler
-// to allow for connection reuse between function invocations.
 const prisma = new PrismaClient();
 
 export default async function handler(request, response) {
+  // --- THIS IS THE FIX ---
+  // Handle the OPTIONS preflight request from the browser
+  if (request.method === "OPTIONS") {
+    return response.status(200).end();
+  }
+
   // Only allow POST requests, reject all others
   if (request.method !== "POST") {
     response.setHeader("Allow", ["POST"]);
@@ -22,7 +26,7 @@ export default async function handler(request, response) {
     // 2. Try to save the new email to the database
     const newEntry = await prisma.waitlistEntry.create({
       data: {
-        email: email.toLowerCase(), // Store emails in lowercase for consistency
+        email: email.toLowerCase(),
       },
     });
     console.log(`New waitlist entry: ${newEntry.email}`);
@@ -30,15 +34,13 @@ export default async function handler(request, response) {
       .status(201)
       .json({ message: "Success! You're on the list." });
   } catch (error) {
-    // 3. Handle potential errors, especially duplicate entries
+    // 3. Handle potential errors
     if (error.code === "P2002") {
-      // Prisma's unique constraint violation code
       return response
         .status(409)
         .json({ message: "This email is already on the list." });
     }
 
-    // For all other errors
     console.error("Failed to add to waitlist:", error);
     return response
       .status(500)
