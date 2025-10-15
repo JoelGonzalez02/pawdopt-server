@@ -10,6 +10,17 @@ const logger = pino({
 });
 
 export default async function handler(req, res) {
+  // --- CORS HEADERS ---
+  res.setHeader("Access-Control-Allow-Origin", "*"); // or set to your frontend domain
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // --- Handle preflight ---
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  // --- Reject unsupported methods ---
   if (req.method !== "POST") {
     return res.status(405).json({ message: "Method Not Allowed" });
   }
