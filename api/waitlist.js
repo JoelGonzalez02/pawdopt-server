@@ -1,49 +1,43 @@
 import { PrismaClient } from "@prisma/client";
+import pino from "pino";
 
 const prisma = new PrismaClient();
+const logger = pino({
+  transport:
+    process.env.NODE_ENV !== "production"
+      ? { target: "pino-pretty" }
+      : undefined,
+});
 
-export default async function handler(request, response) {
-  // --- THIS IS THE FIX ---
-  // Handle the OPTIONS preflight request from the browser
-  if (request.method === "OPTIONS") {
-    return response.status(200).end();
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ message: "Method Not Allowed" });
   }
 
-  // Only allow POST requests, reject all others
-  if (request.method !== "POST") {
-    response.setHeader("Allow", ["POST"]);
-    return response.status(405).end(`Method ${request.method} Not Allowed`);
-  }
+  const { email } = req.body;
 
-  const { email } = request.body;
-
-  // 1. Basic Validation
   if (!email || !email.includes("@")) {
-    return response.status(400).json({ message: "A valid email is required." });
+    return res.status(400).json({ message: "A valid email is required." });
   }
 
   try {
-    // 2. Try to save the new email to the database
     const newEntry = await prisma.waitlistEntry.create({
-      data: {
-        email: email.toLowerCase(),
-      },
+      data: { email: email.toLowerCase() },
     });
-    console.log(`New waitlist entry: ${newEntry.email}`);
-    return response
-      .status(201)
-      .json({ message: "Success! You're on the list." });
+
+    logger.info({ email: newEntry.email }, "New waitlist entry created");
+    return res.status(201).json({ message: "Success! You're on the list." });
   } catch (error) {
-    // 3. Handle potential errors
     if (error.code === "P2002") {
-      return response
+      logger.info({ email }, "Duplicate waitlist entry attempt");
+      return res
         .status(409)
         .json({ message: "This email is already on the list." });
     }
 
-    console.error("Failed to add to waitlist:", error);
-    return response
+    logger.error({ err: error, email }, "Failed to add to waitlist");
+    return res
       .status(500)
-      .json({ message: "Something went wrong. Please try again." });
+      .json({ message: "Something went wrong. Please try again later." });
   }
 }
