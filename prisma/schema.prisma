@@ -9,63 +9,43 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model AnimalWithVideo {
-  id        Int      @id
-  name      String
-  url       String
-  type      String
-  age       String
-  gender    String
-  size      String
-  status    String
-  likeCount Int      @default(0)
-  
-  // Store complex objects as JSON
-  breeds      Json
-  colors      Json
-  photos      Json
-  videos      Json
-  contact     Json
-  attributes  Json     @default("{}")
-  environment Json     @default("{}")
+// Model is no longer used, but keeping it here as per your file
+model RescueGroupsAnimal {
+  id            Int      @id
+  attributes    Json
+  relationships Json
+  includedData  Json?
+  status        String?
+  animalType    String?
+  name          String?
+  city          String?
+  state         String?
+  latitude      Float?
+  longitude     Float?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  orgId         String?
+  organization  RescueGroupsOrg? @relation(fields: [orgId], references: [id])
 
-  // Location and Timestamps
-  city       String
-  state      String
-  latitude   Float?
-  longitude  Float?
-  createdAt  DateTime @default(now())
-  lastSeenAt DateTime @updatedAt
-
-  // --- NEW RELATIONSHIP FIELDS ---
-  organizationId String?
-  organization   Organization? @relation(fields: [organizationId], references: [id])
-
-  @@index([city, state, type])
+  @@index([animalType, status])
 }
 
-// --- NEW MODEL FOR ORGANIZATIONS ---
-model Organization {
-  id      String   @id // The ID from Petfinder (e.g., "CA123")
-  name    String
-  email   String?
-  phone   String?
-  address Json?    // Store the address object as JSON
-  url     String
-  
-  // This creates the other side of the relationship to AnimalWithVideo
-  animals AnimalWithVideo[]
+// Model is no longer used
+model RescueGroupsOrg {
+  id      String @id
+  data    Json
+  animals RescueGroupsAnimal[]
 
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
-// --- Your existing User and SeenVideo models ---
 model User {
-  id         Int         @id @default(autoincrement())
-  uuid       String      @unique
-  createdAt  DateTime    @default(now()) @map("created_at")
-  seenVideos SeenVideo[]
+  id          Int         @id @default(autoincrement())
+  uuid        String      @unique
+  createdAt   DateTime    @default(now()) @map("created_at")
+  seenVideos  SeenVideo[]
+  seenAnimals SeenAnimal[]
 
   @@map("users")
 }
@@ -78,4 +58,70 @@ model SeenVideo {
 
   @@id([userId, animalId])
   @@map("seen_videos")
+}
+
+model SeenAnimal {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  animalId  Int
+  createdAt DateTime @default(now())
+
+  user   User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // --- THIS LINE IS THE FIX ---
+  animal AnimalWithVideo   @relation(fields: [animalId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, animalId])
+  @@index([userId])
+}
+
+model AnimalWithVideo {
+  id               Int           @id
+  name             String
+  url              String
+  type             String
+  age              String
+  gender           String
+  size             String
+  status           String
+  likeCount        Int           @default(0)
+  breeds           Json
+  colors           Json
+  photos           Json
+  videos           Json
+  contact          Json
+  attributes       Json          @default("{}")
+  environment      Json          @default("{}")
+  city             String
+  state            String
+  latitude         Float?
+  longitude        Float?
+  createdAt        DateTime      @default(now())
+  lastSeenAt       DateTime      @updatedAt
+  organizationId   String?
+  organization     Organization? @relation(fields: [organizationId], references: [id])
+  
+  // ADD THIS BACK-RELATION
+  seenByUsers      SeenAnimal[]
+
+  @@index([city, state, type])
+}
+
+model Organization {
+  id        String            @id
+  name      String
+  email     String?
+  phone     String?
+  address   Json?
+  url       String
+  animals   AnimalWithVideo[]
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+}
+
+model WaitlistEntry {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique // Ensures no duplicate emails
+  createdAt DateTime @default(now())
+
+  @@map("waitlist_entries")
 }
