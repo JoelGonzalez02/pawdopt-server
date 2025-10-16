@@ -13,7 +13,7 @@ const logger = pino({
       ? { target: "pino-pretty" }
       : undefined,
 });
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 12;
 
 redis.on("error", (err) => logger.error({ err }, "Redis Client Error"));
 

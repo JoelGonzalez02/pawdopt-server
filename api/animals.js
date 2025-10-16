@@ -1,19 +1,13 @@
-// api/animals.js
-
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import Redis from "ioredis";
-import axios from "axios";
 import querystring from "querystring";
 import pino from "pino";
 import { URL } from "url";
+import opencage from "opencage-api-client";
 
 // --- INITIALIZATION ---
 const prisma = new PrismaClient();
-const redis = new Redis(process.env.REDIS_URL, {
-  tls: {
-    rejectUnauthorized: false,
-  },
-});
+const redis = new Redis(process.env.REDIS_URL);
 const logger = pino({
   transport:
     process.env.NODE_ENV !== "production"
@@ -23,33 +17,41 @@ const logger = pino({
 
 redis.on("error", (err) => logger.error({ err }, "Redis Client Error"));
 
-// --- HELPER: TOKEN MANAGEMENT ---
-const PETFINDER_TOKEN_KEY = "petfinder_token";
+// --- HELPER: GET AND CACHE COORDINATES ---
+const getUserCoordinates = async (location) => {
+  if (!location || typeof location !== "string") return null;
 
-const getPetfinderToken = async () => {
-  let token = await redis.get(PETFINDER_TOKEN_KEY);
-  if (token) return token;
+  const sanitizedLocation = location.toLowerCase().replace(/[^a-z0-9,]/g, "");
+  const cacheKey = `coords:${sanitizedLocation}`;
 
-  logger.info("Fetching new Petfinder token...");
   try {
-    const response = await axios.post(
-      "https://api.petfinder.com/v2/oauth2/token",
-      querystring.stringify({
-        grant_type: "client_credentials",
-        client_id: process.env.PETFINDER_CLIENT_ID,
-        client_secret: process.env.PETFINDER_CLIENT_SECRET,
-      })
+    const cachedCoords = await redis.get(cacheKey);
+    if (cachedCoords) {
+      logger.info({ location }, `Cache HIT for coordinates`);
+      return JSON.parse(cachedCoords);
+    }
+
+    logger.info(
+      { location },
+      `Cache MISS for coordinates. Calling OpenCage API.`
     );
-    const { access_token, expires_in } = response.data;
-    await redis.set(PETFINDER_TOKEN_KEY, access_token, "EX", expires_in - 60);
-    logger.info("Successfully fetched and cached new token.");
-    return access_token;
+    const geoData = await opencage.geocode({
+      q: location,
+      key: process.env.OPENCAGE_API_KEY,
+    });
+    if (!geoData.results || geoData.results.length === 0) {
+      throw new Error(`Could not determine coordinates for ${location}`);
+    }
+
+    const { lat, lng } = geoData.results[0].geometry;
+    const coords = { lat, lon: lng };
+
+    // Cache coordinates for 30 days
+    await redis.set(cacheKey, JSON.stringify(coords), "EX", 60 * 60 * 24 * 30);
+    return coords;
   } catch (error) {
-    logger.error(
-      { err: error.response?.data || error.message },
-      "Error fetching Petfinder token"
-    );
-    throw new Error("Could not fetch token from Petfinder");
+    logger.error({ err: error, location }, "Failed to get coordinates");
+    return null;
   }
 };
 
@@ -60,16 +62,20 @@ export default async function handler(req, res) {
   }
 
   const fullUrl = new URL(req.url, `https://${req.headers.host}`);
-  const queryParams = Object.fromEntries(fullUrl.searchParams.entries());
+  const query = Object.fromEntries(fullUrl.searchParams.entries());
 
-  // --- FIX: Trim whitespace from all incoming query parameters ---
-  for (const key in queryParams) {
-    if (typeof queryParams[key] === "string") {
-      queryParams[key] = queryParams[key].trim();
-    }
-  }
+  // 1. Destructure all expected filters from the query
+  const {
+    type,
+    age,
+    gender,
+    location,
+    distance = "100", // Default as string to match query
+    page = "1",
+    limit = "20",
+  } = query;
 
-  const cacheKey = `animals:enriched:${querystring.stringify(queryParams)}`;
+  const cacheKey = `db-animals:vercel:${querystring.stringify(query)}`;
 
   try {
     const cachedData = await redis.get(cacheKey);
@@ -79,70 +85,73 @@ export default async function handler(req, res) {
     }
     res.setHeader("X-Cache", "MISS");
 
-    const petfinderToken = await getPetfinderToken();
+    // 2. Build a dynamic 'where' clause for Prisma
+    const whereClause = {
+      status: "adoptable", // Always get adoptable animals
+    };
+    if (type) whereClause.type = type;
+    if (age) whereClause.age = age;
+    if (gender) whereClause.gender = gender;
 
-    const petfinderResponse = await axios.get(
-      "https://api.petfinder.com/v2/animals",
-      {
-        headers: { Authorization: `Bearer ${petfinderToken}` },
-        params: queryParams,
-      }
-    );
-    const data = petfinderResponse.data;
-    if (!data.animals || data.animals.length === 0) {
-      return res.status(200).json(data);
-    }
+    let animalIdsInRadius = null;
 
-    // --- DATA ENRICHMENT LOGIC ---
-    const orgIds = [...new Set(data.animals.map((a) => a.organization_id))];
-    const existingOrgs = await prisma.organization.findMany({
-      where: { id: { in: orgIds } },
-    });
-    const existingOrgIds = new Set(existingOrgs.map((o) => o.id));
-    const missingOrgIds = orgIds.filter((id) => !existingOrgIds.has(id));
-    const newOrgs = [];
+    // 3. If a location is provided, perform a geospatial search first
+    if (location) {
+      const coords = await getUserCoordinates(location);
+      if (coords) {
+        const userLat = coords.lat;
+        const userLon = coords.lon;
+        const radiusKm = Number(distance) * 1.60934;
 
-    if (missingOrgIds.length > 0) {
-      const orgPromises = missingOrgIds.map((orgId) =>
-        axios
-          .get(`https://api.petfinder.com/v2/organizations/${orgId}`, {
-            headers: { Authorization: `Bearer ${petfinderToken}` },
-          })
-          .then((response) => response.data.organization)
-          .catch(() => null)
-      );
-      const fetchedOrgs = (await Promise.all(orgPromises)).filter(Boolean);
+        const results = await prisma.$queryRaw`
+          SELECT id FROM "AnimalWithVideo"
+          WHERE (6371 * acos(LEAST(1.0, cos(radians(${userLat})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${userLon})) + sin(radians(${userLat})) * sin(radians(latitude))))) < ${radiusKm}
+        `;
+        animalIdsInRadius = results.map((r) => r.id);
 
-      if (fetchedOrgs.length > 0) {
-        newOrgs.push(...fetchedOrgs);
-        await prisma.organization.createMany({
-          data: fetchedOrgs.map((org) => ({
-            id: org.id,
-            name: org.name,
-            email: org.email,
-            phone: org.phone,
-            address: org.address,
-            url: org.url,
-          })),
-          skipDuplicates: true,
-        });
+        // If no animals are found in the radius, we can stop early
+        if (animalIdsInRadius.length === 0) {
+          return res
+            .status(200)
+            .json({
+              animals: [],
+              pagination: { current_page: 1, total_pages: 0 },
+            });
+        }
+
+        whereClause.id = { in: animalIdsInRadius };
       }
     }
 
-    const allOrgs = [...existingOrgs, ...newOrgs];
-    data.animals.forEach((animal) => {
-      animal.organization =
-        allOrgs.find((org) => org.id === animal.organization_id) || null;
-    });
-    // --- END ENRICHMENT LOGIC ---
+    const numericPage = Number(page);
+    const numericLimit = Number(limit);
 
-    await redis.set(cacheKey, JSON.stringify(data), "EX", 3600);
-    res.status(200).json(data);
+    // 4. Fetch the final list of animals from your database
+    const animals = await prisma.animalWithVideo.findMany({
+      where: whereClause,
+      include: { organization: true },
+      take: numericLimit,
+      skip: (numericPage - 1) * numericLimit,
+    });
+
+    // 5. Format the response with the correct pagination shape
+    const responseData = {
+      animals,
+      pagination: {
+        current_page: numericPage,
+        // Approximate total pages based on the location search result
+        total_pages: animalIdsInRadius
+          ? Math.ceil(animalIdsInRadius.length / numericLimit)
+          : Math.ceil(animals.length / numericLimit), // Fallback if no location
+      },
+    };
+
+    // Cache the database response for 30 minutes
+    await redis.set(cacheKey, JSON.stringify(responseData), "EX", 1800);
+
+    res.status(200).json(responseData);
   } catch (error) {
-    logger.error(
-      { err: error.response?.data || error.message, query: queryParams },
-      "Error in /api/animals"
-    );
+    logger.error({ err: error.message, query }, "Error in /api/animals");
     res
       .status(500)
       .json({ message: "An error occurred while fetching animals." });
